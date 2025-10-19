@@ -1,5 +1,4 @@
-use std::env;
-
+use rig::prelude::*;
 use rig::{
     agent::AgentBuilder,
     completion::Prompt,
@@ -9,9 +8,7 @@ use rig::{
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let openai_client =
-        openai::Client::new(&env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set"));
-
+    let openai_client = openai::Client::from_env();
     let model = openai_client.completion_model(GPT_4O);
 
     // Load in all the rust examples
@@ -23,7 +20,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create an agent with multiple context documents
     let agent = examples
         .fold(AgentBuilder::new(model), |builder, (path, content)| {
-            builder.context(format!("Rust Example {:?}:\n{}", path, content).as_str())
+            builder.context(format!("Rust Example {path:?}:\n{content}").as_str())
         })
         .build();
 
@@ -31,8 +28,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let response = agent
         .prompt("Which rust example is best suited for the operation 1 + 2")
         .await?;
-
-    println!("{}", response);
-
+    println!("{response}");
     Ok(())
 }

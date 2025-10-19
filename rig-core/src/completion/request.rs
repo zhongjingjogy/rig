@@ -62,35 +62,51 @@
 //!
 //! For more information on how to use the completion functionality, refer to the documentation of
 //! the individual traits, structs, and enums defined in this module.
-use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
-use crate::OneOrMany;
+use super::message::{AssistantContent, DocumentMediaType};
+use crate::client::builder::FinalCompletionResponse;
+use crate::client::completion::CompletionModelHandle;
+use crate::message::ToolChoice;
+use crate::streaming::StreamingCompletionResponse;
+use crate::tool::server::ToolServerError;
+use crate::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
+use crate::{OneOrMany, http_client, streaming};
 use crate::{
     json_utils,
     message::{Message, UserContent},
     tool::ToolSetError,
 };
-
-use super::message::{AssistantContent, ContentFormat, DocumentMediaType};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ops::{Add, AddAssign};
+use std::sync::Arc;
+use thiserror::Error;
 
 // Errors
 #[derive(Debug, Error)]
 pub enum CompletionError {
     /// Http error (e.g.: connection error, timeout, etc.)
     #[error("HttpError: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(#[from] http_client::Error),
 
     /// Json error (e.g.: serialization, deserialization)
     #[error("JsonError: {0}")]
     JsonError(#[from] serde_json::Error),
 
+    /// Url error (e.g.: invalid URL)
+    #[error("UrlError: {0}")]
+    UrlError(#[from] url::ParseError),
+
+    #[cfg(not(target_family = "wasm"))]
     /// Error building the completion request
     #[error("RequestError: {0}")]
     RequestError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    #[cfg(target_family = "wasm")]
+    /// Error building the completion request
+    #[error("RequestError: {0}")]
+    RequestError(#[from] Box<dyn std::error::Error + 'static>),
 
     /// Error parsing the completion response
     #[error("ResponseError: {0}")]
@@ -101,20 +117,42 @@ pub enum CompletionError {
     ProviderError(String),
 }
 
+/// Prompt errors
 #[derive(Debug, Error)]
 pub enum PromptError {
+    /// Something went wrong with the completion
     #[error("CompletionError: {0}")]
     CompletionError(#[from] CompletionError),
 
+    /// There was an error while using a tool
     #[error("ToolCallError: {0}")]
     ToolError(#[from] ToolSetError),
 
+    /// There was an issue while executing a tool on a tool server
+    #[error("ToolServerError: {0}")]
+    ToolServerError(#[from] ToolServerError),
+
+    /// The LLM tried to call too many tools during a multi-turn conversation.
+    /// To fix this, you may either need to lower the amount of tools your model has access to (and then create other agents to share the tool load)
+    /// or increase the amount of turns given in `.multi_turn()`.
     #[error("MaxDepthError: (reached limit: {max_depth})")]
     MaxDepthError {
         max_depth: usize,
-        chat_history: Vec<Message>,
+        chat_history: Box<Vec<Message>>,
         prompt: Message,
     },
+
+    /// A prompting loop was cancelled.
+    #[error("PromptCancelled")]
+    PromptCancelled { chat_history: Box<Vec<Message>> },
+}
+
+impl PromptError {
+    pub(crate) fn prompt_cancelled(chat_history: Vec<Message>) -> Self {
+        Self::PromptCancelled {
+            chat_history: Box::new(chat_history),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -147,7 +185,7 @@ impl std::fmt::Display for Document {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -158,7 +196,7 @@ pub struct ToolDefinition {
 // Implementations
 // ================================================================
 /// Trait defining a high-level LLM simple prompt interface (i.e.: prompt in, response out).
-pub trait Prompt: Send + Sync {
+pub trait Prompt: WasmCompatSend + WasmCompatSync {
     /// Send a simple prompt to the underlying completion model.
     ///
     /// If the completion model's response is a message, then it is returned as a string.
@@ -169,12 +207,12 @@ pub trait Prompt: Send + Sync {
     /// If the tool does not exist, or the tool call fails, then an error is returned.
     fn prompt(
         &self,
-        prompt: impl Into<Message> + Send,
-    ) -> impl std::future::IntoFuture<Output = Result<String, PromptError>, IntoFuture: Send>;
+        prompt: impl Into<Message> + WasmCompatSend,
+    ) -> impl std::future::IntoFuture<Output = Result<String, PromptError>, IntoFuture: WasmCompatSend>;
 }
 
 /// Trait defining a high-level LLM chat interface (i.e.: prompt and chat history in, response out).
-pub trait Chat: Send + Sync {
+pub trait Chat: WasmCompatSend + WasmCompatSync {
     /// Send a prompt with optional chat history to the underlying completion model.
     ///
     /// If the completion model's response is a message, then it is returned as a string.
@@ -185,9 +223,9 @@ pub trait Chat: Send + Sync {
     /// If the tool does not exist, or the tool call fails, then an error is returned.
     fn chat(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
-    ) -> impl std::future::IntoFuture<Output = Result<String, PromptError>, IntoFuture: Send>;
+    ) -> impl std::future::IntoFuture<Output = Result<String, PromptError>, IntoFuture: WasmCompatSend>;
 }
 
 /// Trait defining a low-level LLM completion interface
@@ -205,9 +243,10 @@ pub trait Completion<M: CompletionModel> {
     /// contain the `preamble` provided when creating the agent.
     fn completion(
         &self,
-        prompt: impl Into<Message> + Send,
+        prompt: impl Into<Message> + WasmCompatSend,
         chat_history: Vec<Message>,
-    ) -> impl std::future::Future<Output = Result<CompletionRequestBuilder<M>, CompletionError>> + Send;
+    ) -> impl std::future::Future<Output = Result<CompletionRequestBuilder<M>, CompletionError>>
+    + WasmCompatSend;
 }
 
 /// General completion response struct that contains the high-level completion choice
@@ -217,27 +256,192 @@ pub struct CompletionResponse<T> {
     /// The completion choice (represented by one or more assistant message content)
     /// returned by the completion model provider
     pub choice: OneOrMany<AssistantContent>,
+    /// Tokens used during prompting and responding
+    pub usage: Usage,
     /// The raw response returned by the completion model provider
     pub raw_response: T,
+}
+
+/// A trait for grabbing the token usage of a completion response.
+///
+/// Primarily designed for streamed completion responses in streamed multi-turn, as otherwise it would be impossible to do.
+pub trait GetTokenUsage {
+    fn token_usage(&self) -> Option<crate::completion::Usage>;
+}
+
+impl GetTokenUsage for () {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        None
+    }
+}
+
+impl<T> GetTokenUsage for Option<T>
+where
+    T: GetTokenUsage,
+{
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        if let Some(usage) = self {
+            usage.token_usage()
+        } else {
+            None
+        }
+    }
+}
+
+/// Struct representing the token usage for a completion request.
+/// If tokens used are `0`, then the provider failed to supply token usage metrics.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+pub struct Usage {
+    /// The number of input ("prompt") tokens used in a given request.
+    pub input_tokens: u64,
+    /// The number of output ("completion") tokens used in a given request.
+    pub output_tokens: u64,
+    /// We store this separately as some providers may only report one number
+    pub total_tokens: u64,
+}
+
+impl Usage {
+    /// Creates a new instance of `Usage`.
+    pub fn new() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        }
+    }
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        Self {
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+            total_tokens: self.total_tokens + other.total_tokens,
+        }
+    }
+}
+
+impl AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
 }
 
 /// Trait defining a completion model that can be used to generate completion responses.
 /// This trait is meant to be implemented by the user to define a custom completion model,
 /// either from a third party provider (e.g.: OpenAI) or a local model.
-pub trait CompletionModel: Clone + Send + Sync {
+pub trait CompletionModel: Clone + WasmCompatSend + WasmCompatSync {
     /// The raw response type returned by the underlying completion model.
-    type Response: Send + Sync;
+    type Response: WasmCompatSend + WasmCompatSync + Serialize + DeserializeOwned;
+    /// The raw response type returned by the underlying completion model when streaming.
+    type StreamingResponse: Clone
+        + Unpin
+        + WasmCompatSend
+        + WasmCompatSync
+        + Serialize
+        + DeserializeOwned
+        + GetTokenUsage;
 
     /// Generates a completion response for the given completion request.
     fn completion(
         &self,
         request: CompletionRequest,
-    ) -> impl std::future::Future<Output = Result<CompletionResponse<Self::Response>, CompletionError>>
-           + Send;
+    ) -> impl std::future::Future<
+        Output = Result<CompletionResponse<Self::Response>, CompletionError>,
+    > + WasmCompatSend;
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> impl std::future::Future<
+        Output = Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>,
+    > + WasmCompatSend;
 
     /// Generates a completion request builder for the given `prompt`.
     fn completion_request(&self, prompt: impl Into<Message>) -> CompletionRequestBuilder<Self> {
         CompletionRequestBuilder::new(self.clone(), prompt)
+    }
+}
+pub trait CompletionModelDyn: WasmCompatSend + WasmCompatSync {
+    fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> WasmBoxedFuture<'_, Result<CompletionResponse<()>, CompletionError>>;
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> WasmBoxedFuture<
+        '_,
+        Result<StreamingCompletionResponse<FinalCompletionResponse>, CompletionError>,
+    >;
+
+    fn completion_request(
+        &self,
+        prompt: Message,
+    ) -> CompletionRequestBuilder<CompletionModelHandle<'_>>;
+}
+
+impl<T, R> CompletionModelDyn for T
+where
+    T: CompletionModel<StreamingResponse = R>,
+    R: Clone + Unpin + GetTokenUsage + 'static,
+{
+    fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> WasmBoxedFuture<'_, Result<CompletionResponse<()>, CompletionError>> {
+        Box::pin(async move {
+            self.completion(request)
+                .await
+                .map(|resp| CompletionResponse {
+                    choice: resp.choice,
+                    usage: resp.usage,
+                    raw_response: (),
+                })
+        })
+    }
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> WasmBoxedFuture<
+        '_,
+        Result<StreamingCompletionResponse<FinalCompletionResponse>, CompletionError>,
+    > {
+        Box::pin(async move {
+            let resp = self.stream(request).await?;
+            let inner = resp.inner;
+
+            let stream = streaming::StreamingResultDyn {
+                inner: Box::pin(inner),
+            };
+
+            Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
+        })
+    }
+
+    /// Generates a completion request builder for the given `prompt`.
+    fn completion_request(
+        &self,
+        prompt: Message,
+    ) -> CompletionRequestBuilder<CompletionModelHandle<'_>> {
+        CompletionRequestBuilder::new(
+            CompletionModelHandle {
+                inner: Arc::new(self.clone()),
+            },
+            prompt,
+        )
     }
 }
 
@@ -246,8 +450,8 @@ pub trait CompletionModel: Clone + Send + Sync {
 pub struct CompletionRequest {
     /// The preamble to be sent to the completion model provider
     pub preamble: Option<String>,
-    /// The chat history to be sent to the completion model provider
-    /// The very last message will always be the prompt (hense why there is *always* one)
+    /// The chat history to be sent to the completion model provider.
+    /// The very last message will always be the prompt (hence why there is *always* one)
     pub chat_history: OneOrMany<Message>,
     /// The documents to be sent to the completion model provider
     pub documents: Vec<Document>,
@@ -257,6 +461,8 @@ pub struct CompletionRequest {
     pub temperature: Option<f64>,
     /// The max tokens to be sent to the completion model provider
     pub max_tokens: Option<u64>,
+    /// Whether tools are required to be used by the model provider or not before providing a response.
+    pub tool_choice: Option<ToolChoice>,
     /// Additional provider-specific parameters to be sent to the completion model provider
     pub additional_params: Option<serde_json::Value>,
 }
@@ -280,7 +486,6 @@ impl CompletionRequest {
                     doc.to_string(),
                     // In the future, we can customize `Document` to pass these extra types through.
                     // Most providers ditch these but they might want to use them.
-                    Some(ContentFormat::String),
                     Some(DocumentMediaType::TXT),
                 )
             })
@@ -345,6 +550,7 @@ pub struct CompletionRequestBuilder<M: CompletionModel> {
     tools: Vec<ToolDefinition>,
     temperature: Option<f64>,
     max_tokens: Option<u64>,
+    tool_choice: Option<ToolChoice>,
     additional_params: Option<serde_json::Value>,
 }
 
@@ -359,6 +565,7 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
             tools: Vec::new(),
             temperature: None,
             max_tokens: None,
+            tool_choice: None,
             additional_params: None,
         }
     }
@@ -366,6 +573,11 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
     /// Sets the preamble for the completion request.
     pub fn preamble(mut self, preamble: String) -> Self {
         self.preamble = Some(preamble);
+        self
+    }
+
+    pub fn without_preamble(mut self) -> Self {
+        self.preamble = None;
         self
     }
 
@@ -461,6 +673,12 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
         self
     }
 
+    /// Sets the thing.
+    pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
     /// Builds the completion request.
     pub fn build(self) -> CompletionRequest {
         let chat_history = OneOrMany::many([self.chat_history, vec![self.prompt]].concat())
@@ -473,6 +691,7 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
             tools: self.tools,
             temperature: self.temperature,
             max_tokens: self.max_tokens,
+            tool_choice: self.tool_choice,
             additional_params: self.additional_params,
         }
     }
@@ -482,13 +701,15 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
         let model = self.model.clone();
         model.completion(self.build()).await
     }
-}
 
-impl<M: StreamingCompletionModel> CompletionRequestBuilder<M> {
     /// Stream the completion request
-    pub async fn stream(
+    pub async fn stream<'a>(
         self,
-    ) -> Result<StreamingCompletionResponse<M::StreamingResponse>, CompletionError> {
+    ) -> Result<StreamingCompletionResponse<M::StreamingResponse>, CompletionError>
+    where
+        <M as CompletionModel>::StreamingResponse: 'a,
+        Self: 'a,
+    {
         let model = self.model.clone();
         model.stream(self.build()).await
     }
@@ -508,7 +729,7 @@ mod tests {
         };
 
         let expected = "<file id: 123>\nThis is a test document.\n</file>\n";
-        assert_eq!(format!("{}", doc), expected);
+        assert_eq!(format!("{doc}"), expected);
     }
 
     #[test]
@@ -529,7 +750,7 @@ mod tests {
             "This is a test document.\n",
             "</file>\n"
         );
-        assert_eq!(format!("{}", doc), expected);
+        assert_eq!(format!("{doc}"), expected);
     }
 
     #[test]
@@ -553,6 +774,7 @@ mod tests {
             tools: Vec::new(),
             temperature: None,
             max_tokens: None,
+            tool_choice: None,
             additional_params: None,
         };
 
@@ -560,12 +782,10 @@ mod tests {
             content: OneOrMany::many(vec![
                 UserContent::document(
                     "<file id: doc1>\nDocument 1 text.\n</file>\n".to_string(),
-                    Some(ContentFormat::String),
                     Some(DocumentMediaType::TXT),
                 ),
                 UserContent::document(
                     "<file id: doc2>\nDocument 2 text.\n</file>\n".to_string(),
-                    Some(ContentFormat::String),
                     Some(DocumentMediaType::TXT),
                 ),
             ])
@@ -584,6 +804,7 @@ mod tests {
             tools: Vec::new(),
             temperature: None,
             max_tokens: None,
+            tool_choice: None,
             additional_params: None,
         };
 

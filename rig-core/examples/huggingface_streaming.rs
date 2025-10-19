@@ -1,8 +1,10 @@
+use rig::prelude::*;
 use std::env;
 
+use rig::agent::stream_to_stdout;
 use rig::{
     providers::huggingface::{self},
-    streaming::{stream_to_stdout, StreamingPrompt},
+    streaming::StreamingPrompt,
 };
 
 #[tokio::main]
@@ -20,8 +22,7 @@ async fn main() -> Result<(), anyhow::Error> {
 }
 
 async fn hf_inference(api_key: &str) -> Result<(), anyhow::Error> {
-    let agent = huggingface::ClientBuilder::new(api_key)
-        .build()
+    let agent = huggingface::Client::new(api_key)
         .agent("meta-llama/Llama-3.1-8B-Instruct")
         .preamble("Be precise and concise.")
         .temperature(0.5)
@@ -30,9 +31,9 @@ async fn hf_inference(api_key: &str) -> Result<(), anyhow::Error> {
     // Stream the response and print chunks as they arrive
     let mut stream = agent
         .stream_prompt("When and where and what type is the next solar eclipse?")
-        .await?;
+        .await;
 
-    stream_to_stdout(&agent, &mut stream).await?;
+    let _ = stream_to_stdout(&mut stream).await?;
 
     Ok(())
 }
@@ -40,7 +41,7 @@ async fn hf_inference(api_key: &str) -> Result<(), anyhow::Error> {
 async fn together(api_key: &str) -> Result<(), anyhow::Error> {
     let agent = huggingface::ClientBuilder::new(api_key)
         .sub_provider(huggingface::SubProvider::Together)
-        .build()
+        .build()?
         .agent("deepseek-ai/DeepSeek-R1")
         .preamble("Be precise and concise.")
         .temperature(0.5)
@@ -49,9 +50,9 @@ async fn together(api_key: &str) -> Result<(), anyhow::Error> {
     // Stream the response and print chunks as they arrive
     let mut stream = agent
         .stream_prompt("When and where and what type is the next solar eclipse?")
-        .await?;
+        .await;
 
-    stream_to_stdout(&agent, &mut stream).await?;
+    let _ = stream_to_stdout(&mut stream).await?;
 
     Ok(())
 }

@@ -1,7 +1,9 @@
-use std::env;
+use rig::prelude::*;
 
 use rig::completion::Prompt;
+
 use rig::providers::openai::client::Client;
+
 use schemars::JsonSchema;
 
 #[derive(serde::Deserialize, JsonSchema, serde::Serialize, Debug)]
@@ -9,7 +11,6 @@ struct Evaluation {
     evaluation_status: EvalStatus,
     feedback: String,
 }
-
 #[derive(serde::Deserialize, JsonSchema, serde::Serialize, Debug, PartialEq)]
 enum EvalStatus {
     Pass,
@@ -22,12 +23,10 @@ const TASK: &str = "Implement a Stack with:
 3. getMin()
 All operations should be O(1).
 ";
-
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
-    let openai_api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
-    let openai_client = Client::new(&openai_api_key);
+    let openai_client = Client::from_env();
 
     let generator_agent = openai_client
         .agent("gpt-4")
@@ -65,7 +64,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     let mut memories: Vec<String> = Vec::new();
-
     let mut response = generator_agent.prompt(TASK).await.unwrap();
     memories.push(response.clone());
 
@@ -74,18 +72,15 @@ async fn main() -> Result<(), anyhow::Error> {
             .extract(&format!("{TASK}\n\n{response}"))
             .await
             .unwrap();
-
         if eval_result.evaluation_status == EvalStatus::Pass {
             break;
         } else {
             let context = format!("{TASK}\n\n{}", eval_result.feedback);
-
             response = generator_agent.prompt(context).await.unwrap();
             memories.push(response.clone());
         }
     }
 
     println!("Response: {response}");
-
     Ok(())
 }

@@ -1,23 +1,35 @@
 //! Anthropic completion api implementation
 
+use crate::{
+    OneOrMany,
+    completion::{self, CompletionError, GetTokenUsage},
+    http_client::HttpClientExt,
+    json_utils,
+    message::{self, DocumentMediaType, DocumentSourceKind, MessageError, Reasoning},
+    one_or_many::string_or_one_or_many,
+    telemetry::{ProviderResponseExt, SpanCombinator},
+    wasm_compat::*,
+};
 use std::{convert::Infallible, str::FromStr};
 
-use crate::{
-    completion::{self, CompletionError},
-    json_utils,
-    message::{self, DocumentMediaType, MessageError},
-    one_or_many::string_or_one_or_many,
-    OneOrMany,
-};
-
+use super::client::Client;
+use crate::completion::CompletionRequest;
+use crate::providers::anthropic::streaming::StreamingCompletionResponse;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-
-use super::client::Client;
+use tracing::{Instrument, info_span};
 
 // ================================================================
 // Anthropic Completion API
 // ================================================================
+
+/// `claude-opus-4-0` completion model
+pub const CLAUDE_4_OPUS: &str = "claude-opus-4-0";
+
+/// `claude-sonnet-4-0` completion model
+pub const CLAUDE_4_SONNET: &str = "claude-sonnet-4-0";
+
 /// `claude-3-7-sonnet-latest` completion model
 pub const CLAUDE_3_7_SONNET: &str = "claude-3-7-sonnet-latest";
 
@@ -40,7 +52,7 @@ pub const ANTHROPIC_VERSION_2023_01_01: &str = "2023-01-01";
 pub const ANTHROPIC_VERSION_2023_06_01: &str = "2023-06-01";
 pub const ANTHROPIC_VERSION_LATEST: &str = ANTHROPIC_VERSION_2023_06_01;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub content: Vec<Content>,
     pub id: String,
@@ -51,7 +63,45 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl ProviderResponseExt for CompletionResponse {
+    type OutputMessage = Content;
+    type Usage = Usage;
+
+    fn get_response_id(&self) -> Option<String> {
+        Some(self.id.to_owned())
+    }
+
+    fn get_response_model_name(&self) -> Option<String> {
+        Some(self.model.to_owned())
+    }
+
+    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
+        self.content.clone()
+    }
+
+    fn get_text_response(&self) -> Option<String> {
+        let res = self
+            .content
+            .iter()
+            .filter_map(|x| {
+                if let Content::Text { text } = x {
+                    Some(text.to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        if res.is_empty() { None } else { Some(res) }
+    }
+
+    fn get_usage(&self) -> Option<Self::Usage> {
+        Some(self.usage.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: Option<u64>,
@@ -75,6 +125,20 @@ impl std::fmt::Display for Usage {
             },
             self.output_tokens
         )
+    }
+}
+
+impl GetTokenUsage for Usage {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let mut usage = crate::completion::Usage::new();
+
+        usage.input_tokens = self.input_tokens
+            + self.cache_creation_input_tokens.unwrap_or_default()
+            + self.cache_read_input_tokens.unwrap_or_default();
+        usage.output_tokens = self.output_tokens;
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
+
+        Some(usage)
     }
 }
 
@@ -107,7 +171,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     _ => {
                         return Err(CompletionError::ResponseError(
                             "Response did not contain a message or tool call".into(),
-                        ))
+                        ));
                     }
                 })
             })
@@ -119,8 +183,15 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )
         })?;
 
+        let usage = completion::Usage {
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+            total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+        };
+
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
@@ -164,6 +235,10 @@ pub enum Content {
     Document {
         source: DocumentSource,
     },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
 }
 
 impl FromStr for Content {
@@ -190,8 +265,44 @@ impl FromStr for ToolResultContent {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ImageSourceData {
+    Base64(String),
+    Url(String),
+}
+
+impl From<ImageSourceData> for DocumentSourceKind {
+    fn from(value: ImageSourceData) -> Self {
+        match value {
+            ImageSourceData::Base64(data) => DocumentSourceKind::Base64(data),
+            ImageSourceData::Url(url) => DocumentSourceKind::Url(url),
+        }
+    }
+}
+
+impl TryFrom<DocumentSourceKind> for ImageSourceData {
+    type Error = MessageError;
+
+    fn try_from(value: DocumentSourceKind) -> Result<Self, Self::Error> {
+        match value {
+            DocumentSourceKind::Base64(data) => Ok(ImageSourceData::Base64(data)),
+            DocumentSourceKind::Url(url) => Ok(ImageSourceData::Url(url)),
+            _ => Err(MessageError::ConversionError("Content has no body".into())),
+        }
+    }
+}
+
+impl From<ImageSourceData> for String {
+    fn from(value: ImageSourceData) -> Self {
+        match value {
+            ImageSourceData::Base64(s) | ImageSourceData::Url(s) => s,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ImageSource {
-    pub data: String,
+    pub data: ImageSourceData,
     pub media_type: ImageFormat,
     pub r#type: SourceType,
 }
@@ -230,6 +341,7 @@ pub enum DocumentFormat {
 #[serde(rename_all = "lowercase")]
 pub enum SourceType {
     BASE64,
+    URL,
 }
 
 impl From<String> for Content {
@@ -250,8 +362,9 @@ impl TryFrom<message::ContentFormat> for SourceType {
     fn try_from(format: message::ContentFormat) -> Result<Self, Self::Error> {
         match format {
             message::ContentFormat::Base64 => Ok(SourceType::BASE64),
+            message::ContentFormat::Url => Ok(SourceType::URL),
             message::ContentFormat::String => Err(MessageError::ConversionError(
-                "Image urls are not supported in Anthropic".to_owned(),
+                "ContentFormat::String is deprecated, use ContentFormat::Url for URLs".into(),
             )),
         }
     }
@@ -261,6 +374,7 @@ impl From<SourceType> for message::ContentFormat {
     fn from(source_type: SourceType) -> Self {
         match source_type {
             SourceType::BASE64 => message::ContentFormat::Base64,
+            SourceType::URL => message::ContentFormat::Url,
         }
     }
 }
@@ -277,7 +391,7 @@ impl TryFrom<message::ImageMediaType> for ImageFormat {
             _ => {
                 return Err(MessageError::ConversionError(
                     format!("Unsupported image media type: {media_type:?}").to_owned(),
-                ))
+                ));
             }
         })
     }
@@ -311,13 +425,21 @@ impl From<message::AssistantContent> for Content {
     fn from(text: message::AssistantContent) -> Self {
         match text {
             message::AssistantContent::Text(message::Text { text }) => Content::Text { text },
-            message::AssistantContent::ToolCall(message::ToolCall { id, function }) => {
+            message::AssistantContent::ToolCall(message::ToolCall { id, function, .. }) => {
                 Content::ToolUse {
                     id,
                     name: function.name,
                     input: function.arguments,
                 }
             }
+            message::AssistantContent::Reasoning(Reasoning {
+                reasoning,
+                signature,
+                ..
+            }) => Content::Thinking {
+                thinking: reasoning.first().cloned().unwrap_or(String::new()),
+                signature,
+            },
         }
     }
 }
@@ -333,83 +455,101 @@ impl TryFrom<message::Message> for Message {
                     message::UserContent::Text(message::Text { text }) => {
                         Ok(Content::Text { text })
                     }
-                    message::UserContent::ToolResult(message::ToolResult { id, content }) => {
-                        Ok(Content::ToolResult {
-                            tool_use_id: id,
-                            content: content.try_map(|content| match content {
-                                message::ToolResultContent::Text(message::Text { text }) => {
-                                    Ok(ToolResultContent::Text { text })
-                                }
-                                message::ToolResultContent::Image(image) => {
-                                    let media_type =
-                                        image.media_type.ok_or(MessageError::ConversionError(
-                                            "Image media type is required".to_owned(),
-                                        ))?;
-                                    let format =
-                                        image.format.ok_or(MessageError::ConversionError(
-                                            "Image format is required".to_owned(),
-                                        ))?;
-                                    Ok(ToolResultContent::Image(ImageSource {
-                                        data: image.data,
-                                        media_type: media_type.try_into()?,
-                                        r#type: format.try_into()?,
-                                    }))
-                                }
-                            })?,
-                            is_error: None,
-                        })
-                    }
-                    message::UserContent::Image(message::Image {
-                        data,
-                        format,
-                        media_type,
-                        ..
-                    }) => {
-                        let source = ImageSource {
-                            data,
-                            media_type: match media_type {
-                                Some(media_type) => media_type.try_into()?,
-                                None => {
+                    message::UserContent::ToolResult(message::ToolResult {
+                        id, content, ..
+                    }) => Ok(Content::ToolResult {
+                        tool_use_id: id,
+                        content: content.try_map(|content| match content {
+                            message::ToolResultContent::Text(message::Text { text }) => {
+                                Ok(ToolResultContent::Text { text })
+                            }
+                            message::ToolResultContent::Image(image) => {
+                                let DocumentSourceKind::Base64(data) = image.data else {
                                     return Err(MessageError::ConversionError(
+                                        "Only base64 strings can be used with the Anthropic API"
+                                            .to_string(),
+                                    ));
+                                };
+                                let media_type =
+                                    image.media_type.ok_or(MessageError::ConversionError(
                                         "Image media type is required".to_owned(),
-                                    ))
-                                }
+                                    ))?;
+                                Ok(ToolResultContent::Image(ImageSource {
+                                    data: ImageSourceData::Base64(data),
+                                    media_type: media_type.try_into()?,
+                                    r#type: SourceType::BASE64,
+                                }))
+                            }
+                        })?,
+                        is_error: None,
+                    }),
+                    message::UserContent::Image(message::Image {
+                        data, media_type, ..
+                    }) => {
+                        let media_type = media_type.ok_or(MessageError::ConversionError(
+                            "Image media type is required for Claude API".into(),
+                        ))?;
+
+                        let source = match data {
+                            DocumentSourceKind::Base64(data) => ImageSource {
+                                data: ImageSourceData::Base64(data),
+                                r#type: SourceType::BASE64,
+                                media_type: ImageFormat::try_from(media_type)?,
                             },
-                            r#type: match format {
-                                Some(format) => format.try_into()?,
-                                None => SourceType::BASE64,
+                            DocumentSourceKind::Url(url) => ImageSource {
+                                data: ImageSourceData::Url(url),
+                                r#type: SourceType::URL,
+                                media_type: ImageFormat::try_from(media_type)?,
                             },
+                            DocumentSourceKind::Unknown => {
+                                return Err(MessageError::ConversionError(
+                                    "Image content has no body".into(),
+                                ));
+                            }
+                            doc => {
+                                return Err(MessageError::ConversionError(format!(
+                                    "Unsupported document type: {doc:?}"
+                                )));
+                            }
                         };
+
                         Ok(Content::Image { source })
                     }
                     message::UserContent::Document(message::Document {
-                        data,
-                        format,
-                        media_type,
+                        data, media_type, ..
                     }) => {
-                        let Some(media_type) = media_type else {
-                            return Err(MessageError::ConversionError(
-                                "Document media type is required".to_string(),
-                            ));
+                        let media_type = media_type.ok_or(MessageError::ConversionError(
+                            "Document media type is required".to_string(),
+                        ))?;
+
+                        let data = match data {
+                            DocumentSourceKind::Base64(data) | DocumentSourceKind::String(data) => {
+                                data
+                            }
+                            _ => {
+                                return Err(MessageError::ConversionError(
+                                    "Only base64 encoded documents currently supported".into(),
+                                ));
+                            }
                         };
 
                         let source = DocumentSource {
                             data,
                             media_type: media_type.try_into()?,
-                            r#type: match format {
-                                Some(format) => format.try_into()?,
-                                None => SourceType::BASE64,
-                            },
+                            r#type: SourceType::BASE64,
                         };
                         Ok(Content::Document { source })
                     }
                     message::UserContent::Audio { .. } => Err(MessageError::ConversionError(
                         "Audio is not supported in Anthropic".to_owned(),
                     )),
+                    message::UserContent::Video { .. } => Err(MessageError::ConversionError(
+                        "Video is not supported in Anthropic".to_owned(),
+                    )),
                 })?,
             },
 
-            message::Message::Assistant { content } => Message {
+            message::Message::Assistant { content, .. } => Message {
                 content: content.map(|content| content.into()),
                 role: Role::Assistant,
             },
@@ -426,10 +566,16 @@ impl TryFrom<Content> for message::AssistantContent {
             Content::ToolUse { id, name, input } => {
                 message::AssistantContent::tool_call(id, name, input)
             }
+            Content::Thinking {
+                thinking,
+                signature,
+            } => message::AssistantContent::Reasoning(
+                Reasoning::new(&thinking).with_signature(signature),
+            ),
             _ => {
                 return Err(MessageError::ConversionError(
                     format!("Unsupported content type for Assistant role: {content:?}").to_owned(),
-                ))
+                ));
             }
         })
     }
@@ -442,13 +588,8 @@ impl From<ToolResultContent> for message::ToolResultContent {
             ToolResultContent::Image(ImageSource {
                 data,
                 media_type: format,
-                r#type,
-            }) => message::ToolResultContent::image(
-                data,
-                Some(r#type.into()),
-                Some(format.into()),
-                None,
-            ),
+                ..
+            }) => message::ToolResultContent::image_base64(data, Some(format.into()), None),
         }
     }
 }
@@ -471,33 +612,35 @@ impl TryFrom<Message> for message::Message {
                             content.map(|content| content.into()),
                         ),
                         Content::Image { source } => message::UserContent::Image(message::Image {
-                            data: source.data,
-                            format: Some(message::ContentFormat::Base64),
+                            data: source.data.into(),
                             media_type: Some(source.media_type.into()),
                             detail: None,
+                            additional_params: None,
                         }),
                         Content::Document { source } => message::UserContent::document(
                             source.data,
-                            Some(message::ContentFormat::Base64),
                             Some(message::DocumentMediaType::PDF),
                         ),
                         _ => {
                             return Err(MessageError::ConversionError(
                                 "Unsupported content type for User role".to_owned(),
-                            ))
+                            ));
                         }
                     })
                 })?,
             },
             Role::Assistant => match message.content.first() {
-                Content::Text { .. } | Content::ToolUse { .. } => message::Message::Assistant {
-                    content: message.content.try_map(|content| content.try_into())?,
-                },
+                Content::Text { .. } | Content::ToolUse { .. } | Content::Thinking { .. } => {
+                    message::Message::Assistant {
+                        id: None,
+                        content: message.content.try_map(|content| content.try_into())?,
+                    }
+                }
 
                 _ => {
                     return Err(MessageError::ConversionError(
                         format!("Unsupported message for Assistant role: {message:?}").to_owned(),
-                    ))
+                    ));
                 }
             },
         })
@@ -505,14 +648,20 @@ impl TryFrom<Message> for message::Message {
 }
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client>
+where
+    T: WasmCompatSend,
+{
+    pub(crate) client: Client<T>,
     pub model: String,
     pub default_max_tokens: Option<u64>,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T>
+where
+    T: HttpClientExt,
+{
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -527,7 +676,11 @@ impl CompletionModel {
 ///
 /// Dev Note: This is really bad design, I'm not sure why they did it like this..
 fn calculate_max_tokens(model: &str) -> Option<u64> {
-    if model.starts_with("claude-3-5-sonnet") || model.starts_with("claude-3-5-haiku") {
+    if model.starts_with("claude-opus-4") {
+        Some(32000)
+    } else if model.starts_with("claude-sonnet-4") || model.starts_with("claude-3-7-sonnet") {
+        Some(64000)
+    } else if model.starts_with("claude-3-5-sonnet") || model.starts_with("claude-3-5-haiku") {
         Some(8192)
     } else if model.starts_with("claude-3-opus")
         || model.starts_with("claude-3-sonnet")
@@ -540,7 +693,7 @@ fn calculate_max_tokens(model: &str) -> Option<u64> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct Metadata {
+pub struct Metadata {
     user_id: Option<String>,
 }
 
@@ -550,19 +703,65 @@ pub enum ToolChoice {
     #[default]
     Auto,
     Any,
+    None,
     Tool {
         name: String,
     },
 }
+impl TryFrom<message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
 
-impl completion::CompletionModel for CompletionModel {
+    fn try_from(value: message::ToolChoice) -> Result<Self, Self::Error> {
+        let res = match value {
+            message::ToolChoice::Auto => Self::Auto,
+            message::ToolChoice::None => Self::None,
+            message::ToolChoice::Required => Self::Any,
+            message::ToolChoice::Specific { function_names } => {
+                if function_names.len() != 1 {
+                    return Err(CompletionError::ProviderError(
+                        "Only one tool may be specified to be used by Claude".into(),
+                    ));
+                }
+
+                Self::Tool {
+                    name: function_names.first().unwrap().to_string(),
+                }
+            }
+        };
+
+        Ok(res)
+    }
+}
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Clone + Default + WasmCompatSend + WasmCompatSync + 'static,
+{
     type Response = CompletionResponse;
+    type StreamingResponse = StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "anthropic",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = &completion_request.preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = tracing::field::Empty,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
         // Note: Ideally we'd introduce provider-specific Request models to handle the
         // specific requirements of each provider. For now, we just manually check while
         // building the request as a raw JSON document.
@@ -583,6 +782,7 @@ impl completion::CompletionModel for CompletionModel {
             full_history.push(docs);
         }
         full_history.extend(completion_request.chat_history);
+        span.record_model_input(&full_history);
 
         let full_history = full_history
             .into_iter()
@@ -600,6 +800,12 @@ impl completion::CompletionModel for CompletionModel {
             json_utils::merge_inplace(&mut request, json!({ "temperature": temperature }));
         }
 
+        let tool_choice = if let Some(tool_choice) = completion_request.tool_choice {
+            Some(ToolChoice::try_from(tool_choice)?)
+        } else {
+            None
+        };
+
         if !completion_request.tools.is_empty() {
             json_utils::merge_inplace(
                 &mut request,
@@ -613,7 +819,7 @@ impl completion::CompletionModel for CompletionModel {
                             input_schema: tool.parameters,
                         })
                         .collect::<Vec<_>>(),
-                    "tool_choice": ToolChoice::Auto,
+                    "tool_choice": tool_choice,
                 }),
             );
         }
@@ -622,29 +828,70 @@ impl completion::CompletionModel for CompletionModel {
             json_utils::merge_inplace(&mut request, params.clone())
         }
 
-        tracing::debug!("Anthropic completion request: {request}");
+        async move {
+            let request: Vec<u8> = serde_json::to_vec(&request)?;
 
-        let response = self
-            .client
-            .post("/v1/messages")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            match response.json::<ApiResponse<CompletionResponse>>().await? {
-                ApiResponse::Message(completion) => {
-                    tracing::info!(target: "rig",
-                        "Anthropic completion token usage: {}",
-                        completion.usage
-                    );
-                    completion.try_into()
-                }
-                ApiResponse::Error(error) => Err(CompletionError::ProviderError(error.message)),
+            if let Ok(json_str) = String::from_utf8(request.clone()) {
+                tracing::debug!("Request body:\n{}", json_str);
             }
-        } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+
+            let req = self
+                .client
+                .post("/v1/messages")
+                .header("Content-Type", "application/json")
+                .body(request)
+                .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+            let response = self
+                .client
+                .send::<_, Bytes>(req)
+                .await
+                .map_err(CompletionError::HttpError)?;
+
+            if response.status().is_success() {
+                match serde_json::from_slice::<ApiResponse<CompletionResponse>>(
+                    response
+                        .into_body()
+                        .await
+                        .map_err(CompletionError::HttpError)?
+                        .to_vec()
+                        .as_slice(),
+                )? {
+                    ApiResponse::Message(completion) => {
+                        let span = tracing::Span::current();
+                        span.record_model_output(&completion.content);
+                        span.record_response_metadata(&completion);
+                        span.record_token_usage(&completion.usage);
+                        completion.try_into()
+                    }
+                    ApiResponse::Error(ApiErrorResponse { message }) => {
+                        Err(CompletionError::ResponseError(message))
+                    }
+                }
+            } else {
+                let text: String = String::from_utf8_lossy(
+                    &response
+                        .into_body()
+                        .await
+                        .map_err(CompletionError::HttpError)?,
+                )
+                .into();
+                Err(CompletionError::ProviderError(text))
+            }
         }
+        .instrument(span)
+        .await
+    }
+
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
+        CompletionModel::stream(self, request).await
     }
 }
 
@@ -738,93 +985,88 @@ mod tests {
             })
         };
 
-        match assistant_message {
-            Message { role, content } => {
-                assert_eq!(role, Role::Assistant);
-                assert_eq!(
-                    content.first(),
-                    Content::Text {
-                        text: "\n\nHello there, how may I assist you today?".to_owned()
-                    }
-                );
+        let Message { role, content } = assistant_message;
+        assert_eq!(role, Role::Assistant);
+        assert_eq!(
+            content.first(),
+            Content::Text {
+                text: "\n\nHello there, how may I assist you today?".to_owned()
             }
+        );
+
+        let Message { role, content } = assistant_message2;
+        {
+            assert_eq!(role, Role::Assistant);
+            assert_eq!(content.len(), 2);
+
+            let mut iter = content.into_iter();
+
+            match iter.next().unwrap() {
+                Content::Text { text } => {
+                    assert_eq!(text, "\n\nHello there, how may I assist you today?");
+                }
+                _ => panic!("Expected text content"),
+            }
+
+            match iter.next().unwrap() {
+                Content::ToolUse { id, name, input } => {
+                    assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
+                    assert_eq!(name, "get_weather");
+                    assert_eq!(input, json!({"location": "San Francisco, CA"}));
+                }
+                _ => panic!("Expected tool use content"),
+            }
+
+            assert_eq!(iter.next(), None);
         }
 
-        match assistant_message2 {
-            Message { role, content } => {
-                assert_eq!(role, Role::Assistant);
-                assert_eq!(content.len(), 2);
+        let Message { role, content } = user_message;
+        {
+            assert_eq!(role, Role::User);
+            assert_eq!(content.len(), 3);
 
-                let mut iter = content.into_iter();
+            let mut iter = content.into_iter();
 
-                match iter.next().unwrap() {
-                    Content::Text { text } => {
-                        assert_eq!(text, "\n\nHello there, how may I assist you today?");
-                    }
-                    _ => panic!("Expected text content"),
+            match iter.next().unwrap() {
+                Content::Image { source } => {
+                    assert_eq!(
+                        source,
+                        ImageSource {
+                            data: ImageSourceData::Base64("/9j/4AAQSkZJRg...".to_owned()),
+                            media_type: ImageFormat::JPEG,
+                            r#type: SourceType::BASE64,
+                        }
+                    );
                 }
-
-                match iter.next().unwrap() {
-                    Content::ToolUse { id, name, input } => {
-                        assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
-                        assert_eq!(name, "get_weather");
-                        assert_eq!(input, json!({"location": "San Francisco, CA"}));
-                    }
-                    _ => panic!("Expected tool use content"),
-                }
-
-                assert_eq!(iter.next(), None);
+                _ => panic!("Expected image content"),
             }
-        }
 
-        match user_message {
-            Message { role, content } => {
-                assert_eq!(role, Role::User);
-                assert_eq!(content.len(), 3);
-
-                let mut iter = content.into_iter();
-
-                match iter.next().unwrap() {
-                    Content::Image { source } => {
-                        assert_eq!(
-                            source,
-                            ImageSource {
-                                data: "/9j/4AAQSkZJRg...".to_owned(),
-                                media_type: ImageFormat::JPEG,
-                                r#type: SourceType::BASE64,
-                            }
-                        );
-                    }
-                    _ => panic!("Expected image content"),
+            match iter.next().unwrap() {
+                Content::Text { text } => {
+                    assert_eq!(text, "What is in this image?");
                 }
-
-                match iter.next().unwrap() {
-                    Content::Text { text } => {
-                        assert_eq!(text, "What is in this image?");
-                    }
-                    _ => panic!("Expected text content"),
-                }
-
-                match iter.next().unwrap() {
-                    Content::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        assert_eq!(tool_use_id, "toolu_01A09q90qw90lq917835lq9");
-                        assert_eq!(
-                            content.first(),
-                            ToolResultContent::Text {
-                                text: "15 degrees".to_owned()
-                            }
-                        );
-                        assert_eq!(is_error, None);
-                    }
-                    _ => panic!("Expected tool result content"),
-                }
-
-                assert_eq!(iter.next(), None);
+                _ => panic!("Expected text content"),
             }
+
+            match iter.next().unwrap() {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    assert_eq!(tool_use_id, "toolu_01A09q90qw90lq917835lq9");
+                    assert_eq!(
+                        content.first(),
+                        ToolResultContent::Text {
+                            text: "15 degrees".to_owned()
+                        }
+                    );
+                    assert_eq!(is_error, None);
+                }
+                _ => panic!("Expected tool result content"),
+            }
+
+            assert_eq!(iter.next(), None);
         }
     }
 
@@ -894,13 +1136,9 @@ mod tests {
 
                 match iter.next().unwrap() {
                     message::UserContent::Image(message::Image {
-                        data,
-                        format,
-                        media_type,
-                        ..
+                        data, media_type, ..
                     }) => {
-                        assert_eq!(data, "/9j/4AAQSkZJRg...");
-                        assert_eq!(format.unwrap(), message::ContentFormat::Base64);
+                        assert_eq!(data, DocumentSourceKind::base64("/9j/4AAQSkZJRg..."));
                         assert_eq!(media_type, Some(message::ImageMediaType::JPEG));
                     }
                     _ => panic!("Expected image content"),
@@ -915,12 +1153,12 @@ mod tests {
 
                 match iter.next().unwrap() {
                     message::UserContent::Document(message::Document {
-                        data,
-                        format,
-                        media_type,
+                        data, media_type, ..
                     }) => {
-                        assert_eq!(data, "base64_encoded_pdf_data");
-                        assert_eq!(format.unwrap(), message::ContentFormat::Base64);
+                        assert_eq!(
+                            data,
+                            DocumentSourceKind::String("base64_encoded_pdf_data".into())
+                        );
                         assert_eq!(media_type, Some(message::DocumentMediaType::PDF));
                     }
                     _ => panic!("Expected document content"),
@@ -949,11 +1187,13 @@ mod tests {
         }
 
         match converted_assistant_message.clone() {
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 assert_eq!(content.len(), 1);
 
                 match content.first() {
-                    message::AssistantContent::ToolCall(message::ToolCall { id, function }) => {
+                    message::AssistantContent::ToolCall(message::ToolCall {
+                        id, function, ..
+                    }) => {
                         assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
                         assert_eq!(function.name, "get_weather");
                         assert_eq!(function.arguments, json!({"location": "San Francisco, CA"}));
@@ -971,5 +1211,31 @@ mod tests {
         assert_eq!(user_message, original_user_message);
         assert_eq!(assistant_message, original_assistant_message);
         assert_eq!(tool_message, original_tool_message);
+    }
+
+    #[test]
+    fn test_content_format_conversion() {
+        use crate::completion::message::ContentFormat;
+
+        let source_type: SourceType = ContentFormat::Url.try_into().unwrap();
+        assert_eq!(source_type, SourceType::URL);
+
+        let content_format: ContentFormat = SourceType::URL.into();
+        assert_eq!(content_format, ContentFormat::Url);
+
+        let source_type: SourceType = ContentFormat::Base64.try_into().unwrap();
+        assert_eq!(source_type, SourceType::BASE64);
+
+        let content_format: ContentFormat = SourceType::BASE64.into();
+        assert_eq!(content_format, ContentFormat::Base64);
+
+        let result: Result<SourceType, _> = ContentFormat::String.try_into();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ContentFormat::String is deprecated")
+        );
     }
 }

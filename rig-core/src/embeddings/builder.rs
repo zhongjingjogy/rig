@@ -4,13 +4,13 @@
 
 use std::{cmp::max, collections::HashMap};
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 
 use crate::{
-    embeddings::{
-        embed::TextEmbedder, Embed, EmbedError, Embedding, EmbeddingError, EmbeddingModel,
-    },
     OneOrMany,
+    embeddings::{
+        Embed, EmbedError, Embedding, EmbeddingError, EmbeddingModel, embed::TextEmbedder,
+    },
 };
 
 /// Builder for creating embeddings from one or more documents of type `T`.
@@ -47,12 +47,21 @@ use crate::{
 ///     .build()
 ///     .await?;
 /// ```
-pub struct EmbeddingsBuilder<M: EmbeddingModel, T: Embed> {
+#[non_exhaustive]
+pub struct EmbeddingsBuilder<M, T>
+where
+    M: EmbeddingModel,
+    T: Embed,
+{
     model: M,
     documents: Vec<(T, Vec<String>)>,
 }
 
-impl<M: EmbeddingModel, T: Embed> EmbeddingsBuilder<M, T> {
+impl<M, T> EmbeddingsBuilder<M, T>
+where
+    M: EmbeddingModel,
+    T: Embed,
+{
     /// Create a new embedding builder with the given embedding model
     pub fn new(model: M) -> Self {
         Self {
@@ -82,7 +91,11 @@ impl<M: EmbeddingModel, T: Embed> EmbeddingsBuilder<M, T> {
     }
 }
 
-impl<M: EmbeddingModel, T: Embed + Send> EmbeddingsBuilder<M, T> {
+impl<M, T> EmbeddingsBuilder<M, T>
+where
+    M: EmbeddingModel,
+    T: Embed + Send,
+{
     /// Generate embeddings for all documents in the builder.
     /// Returns a vector of tuples, where the first element is the document and the second element is the embeddings (either one embedding or many).
     pub async fn build(self) -> Result<Vec<(T, OneOrMany<Embedding>)>, EmbeddingError> {
@@ -144,8 +157,8 @@ impl<M: EmbeddingModel, T: Embed + Send> EmbeddingsBuilder<M, T> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        embeddings::{embed::EmbedError, embed::TextEmbedder, Embedding, EmbeddingModel},
         Embed,
+        embeddings::{Embedding, EmbeddingModel, embed::EmbedError, embed::TextEmbedder},
     };
 
     use super::EmbeddingsBuilder;
@@ -366,7 +379,7 @@ mod tests {
             .unwrap();
 
         result.sort_by(|(fake_definition_1, _), (fake_definition_2, _)| {
-            fake_definition_1.cmp(&fake_definition_2)
+            fake_definition_1.cmp(fake_definition_2)
         });
 
         assert_eq!(result.len(), 2);

@@ -112,10 +112,10 @@ impl<T: Clone> OneOrMany<T> {
     /// Specialized try map function for OneOrMany objects.
     ///
     /// Same as `OneOrMany::map` but fallible.
-    pub(crate) fn try_map<U, E, F: FnMut(T) -> Result<U, E>>(
-        self,
-        mut op: F,
-    ) -> Result<OneOrMany<U>, E> {
+    pub(crate) fn try_map<U, E, F>(self, mut op: F) -> Result<OneOrMany<U>, E>
+    where
+        F: FnMut(T) -> Result<U, E>,
+    {
         Ok(OneOrMany {
             first: op(self.first)?,
             rest: self
@@ -126,7 +126,7 @@ impl<T: Clone> OneOrMany<T> {
         })
     }
 
-    pub fn iter(&self) -> Iter<T> {
+    pub fn iter(&self) -> Iter<'_, T> {
         Iter {
             first: Some(&self.first),
             rest: self.rest.iter(),
@@ -167,6 +167,16 @@ impl<'a, T> Iterator for Iter<'a, T> {
             self.rest.next()
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let first = if self.first.is_some() { 1 } else { 0 };
+        let max = self.rest.size_hint().1.unwrap_or(0) + first;
+        if max > 0 {
+            (1, Some(max))
+        } else {
+            (0, Some(0))
+        }
+    }
 }
 
 /// Struct returned by call to `OneOrMany::into_iter()`.
@@ -177,7 +187,10 @@ pub struct IntoIter<T> {
 }
 
 /// Implement `Iterator` for `IntoIter<T>`.
-impl<T: Clone> IntoIterator for OneOrMany<T> {
+impl<T> IntoIterator for OneOrMany<T>
+where
+    T: Clone,
+{
     type Item = T;
     type IntoIter = IntoIter<T>;
 
@@ -191,14 +204,26 @@ impl<T: Clone> IntoIterator for OneOrMany<T> {
 
 /// Implement `Iterator` for `IntoIter<T>`.
 /// The Item type of the `Iterator` trait is an owned `T`.
-impl<T: Clone> Iterator for IntoIter<T> {
+impl<T> Iterator for IntoIter<T>
+where
+    T: Clone,
+{
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(first) = self.first.take() {
-            Some(first)
+        match self.first.take() {
+            Some(first) => Some(first),
+            _ => self.rest.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let first = if self.first.is_some() { 1 } else { 0 };
+        let max = self.rest.size_hint().1.unwrap_or(0) + first;
+        if max > 0 {
+            (1, Some(max))
         } else {
-            self.rest.next()
+            (0, Some(0))
         }
     }
 }
@@ -222,12 +247,22 @@ impl<'a, T> Iterator for IterMut<'a, T> {
             self.rest.next()
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let first = if self.first.is_some() { 1 } else { 0 };
+        let max = self.rest.size_hint().1.unwrap_or(0) + first;
+        if max > 0 {
+            (1, Some(max))
+        } else {
+            (0, Some(0))
+        }
+    }
 }
 
 // Serialize `OneOrMany<T>` into a json sequence (akin to `Vec<T>`)
-impl<T: Clone> Serialize for OneOrMany<T>
+impl<T> Serialize for OneOrMany<T>
 where
-    T: Serialize,
+    T: Serialize + Clone,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -430,6 +465,29 @@ mod test {
                 assert_eq!(item, "word");
             }
         });
+    }
+
+    #[test]
+    fn test_size_hint() {
+        let foo = "bar".to_string();
+        let one_or_many = OneOrMany::one(foo);
+        let size_hint = one_or_many.iter().size_hint();
+        assert_eq!(size_hint.0, 1);
+        assert_eq!(size_hint.1, Some(1));
+
+        let vec = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
+        let mut one_or_many = OneOrMany::many(vec).expect("this should never fail");
+        let size_hint = one_or_many.iter().size_hint();
+        assert_eq!(size_hint.0, 1);
+        assert_eq!(size_hint.1, Some(3));
+
+        let size_hint = one_or_many.clone().into_iter().size_hint();
+        assert_eq!(size_hint.0, 1);
+        assert_eq!(size_hint.1, Some(3));
+
+        let size_hint = one_or_many.iter_mut().size_hint();
+        assert_eq!(size_hint.0, 1);
+        assert_eq!(size_hint.1, Some(3));
     }
 
     #[test]

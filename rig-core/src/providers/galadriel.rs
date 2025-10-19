@@ -11,84 +11,196 @@
 //! let gpt4o = client.completion_model(galadriel::GPT_4O);
 //! ```
 use super::openai;
+use crate::client::{CompletionClient, ProviderClient, VerifyClient, VerifyError};
+use crate::http_client::{self, HttpClientExt};
 use crate::json_utils::merge;
+use crate::message::MessageError;
 use crate::providers::openai::send_compatible_streaming_request;
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
+use crate::streaming::StreamingCompletionResponse;
 use crate::{
-    agent::AgentBuilder,
+    OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
-    extractor::ExtractorBuilder,
-    json_utils, message, OneOrMany,
+    impl_conversion_traits, json_utils, message,
 };
-use schemars::JsonSchema;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use tracing::{Instrument, info_span};
 
 // ================================================================
 // Main Galadriel Client
 // ================================================================
 const GALADRIEL_API_BASE_URL: &str = "https://api.galadriel.com/v1/verified";
 
-#[derive(Clone)]
-pub struct Client {
-    base_url: String,
-    http_client: reqwest::Client,
+pub struct ClientBuilder<'a, T = reqwest::Client> {
+    api_key: &'a str,
+    fine_tune_api_key: Option<&'a str>,
+    base_url: &'a str,
+    http_client: T,
 }
 
-impl Client {
-    /// Create a new Galadriel client with the given API key and optional fine-tune API key.
-    pub fn new(api_key: &str, fine_tune_api_key: Option<&str>) -> Self {
-        Self::from_url_with_optional_key(api_key, GALADRIEL_API_BASE_URL, fine_tune_api_key)
-    }
-
-    /// Create a new Galadriel client with the given API key, base API URL, and optional fine-tune API key.
-    pub fn from_url(api_key: &str, base_url: &str, fine_tune_api_key: Option<&str>) -> Self {
-        Self::from_url_with_optional_key(api_key, base_url, fine_tune_api_key)
-    }
-
-    pub fn from_url_with_optional_key(
-        api_key: &str,
-        base_url: &str,
-        fine_tune_api_key: Option<&str>,
-    ) -> Self {
+impl<'a, T> ClientBuilder<'a, T>
+where
+    T: Default,
+{
+    pub fn new(api_key: &'a str) -> Self {
         Self {
-            base_url: base_url.to_string(),
-            http_client: reqwest::Client::builder()
-                .default_headers({
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        format!("Bearer {api_key}")
-                            .parse()
-                            .expect("Bearer token should parse"),
-                    );
-                    if let Some(key) = fine_tune_api_key {
-                        headers.insert(
-                            "Fine-Tune-Authorization",
-                            format!("Bearer {key}")
-                                .parse()
-                                .expect("Bearer token should parse"),
-                        );
-                    }
-                    headers
-                })
-                .build()
-                .expect("Galadriel reqwest client should build"),
+            api_key,
+            fine_tune_api_key: None,
+            base_url: GALADRIEL_API_BASE_URL,
+            http_client: Default::default(),
+        }
+    }
+}
+
+impl<'a, T> ClientBuilder<'a, T> {
+    pub fn fine_tune_api_key(mut self, fine_tune_api_key: &'a str) -> Self {
+        self.fine_tune_api_key = Some(fine_tune_api_key);
+        self
+    }
+
+    pub fn base_url(mut self, base_url: &'a str) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    pub fn with_client<U>(self, http_client: U) -> ClientBuilder<'a, U> {
+        ClientBuilder {
+            api_key: self.api_key,
+            fine_tune_api_key: self.fine_tune_api_key,
+            base_url: self.base_url,
+            http_client,
         }
     }
 
+    pub fn build(self) -> Client<T> {
+        Client {
+            base_url: self.base_url.to_string(),
+            api_key: self.api_key.to_string(),
+            fine_tune_api_key: self.fine_tune_api_key.map(|x| x.to_string()),
+            http_client: self.http_client,
+        }
+    }
+}
+#[derive(Clone)]
+pub struct Client<T = reqwest::Client> {
+    base_url: String,
+    api_key: String,
+    fine_tune_api_key: Option<String>,
+    http_client: T,
+}
+
+impl<T> std::fmt::Debug for Client<T>
+where
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("api_key", &"<REDACTED>")
+            .field("fine_tune_api_key", &"<REDACTED>")
+            .finish()
+    }
+}
+
+impl<T> Client<T>
+where
+    T: Default,
+{
+    /// Create a new Galadriel client builder.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::galadriel::{ClientBuilder, self};
+    ///
+    /// // Initialize the Galadriel client
+    /// let galadriel = Client::builder("your-galadriel-api-key")
+    ///    .build()
+    /// ```
+    pub fn builder(api_key: &str) -> ClientBuilder<'_, T> {
+        ClientBuilder::new(api_key)
+    }
+
+    /// Create a new Galadriel client. For more control, use the `builder` method.
+    ///
+    /// # Panics
+    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
+    pub fn new(api_key: &str) -> Self {
+        Self::builder(api_key).build()
+    }
+}
+
+impl<T> Client<T>
+where
+    T: HttpClientExt,
+{
+    pub(crate) fn post(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+
+        let mut req = http_client::Request::post(url);
+
+        if let Some(fine_tune_key) = self.fine_tune_api_key.clone() {
+            req = req.header("Fine-Tune-Authorization", fine_tune_key);
+        }
+
+        http_client::with_bearer_auth(req, &self.api_key)
+    }
+
+    async fn send<U, R>(
+        &self,
+        req: http_client::Request<U>,
+    ) -> http_client::Result<http_client::Response<http_client::LazyBody<R>>>
+    where
+        U: Into<Bytes> + Send,
+        R: From<Bytes> + Send + 'static,
+    {
+        self.http_client.send(req).await
+    }
+}
+
+impl Client<reqwest::Client> {
+    fn reqwest_post(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        let mut req = self.http_client.post(url).bearer_auth(&self.api_key);
+
+        if let Some(fine_tune_key) = self.fine_tune_api_key.clone() {
+            req = req.header("Fine-Tune-Authorization", fine_tune_key)
+        }
+
+        req
+    }
+}
+
+impl ProviderClient for Client<reqwest::Client> {
     /// Create a new Galadriel client from the `GALADRIEL_API_KEY` environment variable,
     /// and optionally from the `GALADRIEL_FINE_TUNE_API_KEY` environment variable.
     /// Panics if the `GALADRIEL_API_KEY` environment variable is not set.
-    pub fn from_env() -> Self {
+    fn from_env() -> Self {
         let api_key = std::env::var("GALADRIEL_API_KEY").expect("GALADRIEL_API_KEY not set");
         let fine_tune_api_key = std::env::var("GALADRIEL_FINE_TUNE_API_KEY").ok();
-        Self::new(&api_key, fine_tune_api_key.as_deref())
+        let mut builder = Self::builder(&api_key);
+        if let Some(fine_tune_api_key) = fine_tune_api_key.as_deref() {
+            builder = builder.fine_tune_api_key(fine_tune_api_key);
+        }
+        builder.build()
     }
-    fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url)
+
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::ApiKeyWithOptionalKey(api_key, fine_tune_key) = input
+        else {
+            panic!("Incorrect provider value type")
+        };
+        let mut builder = Self::builder(&api_key);
+        if let Some(fine_tune_key) = fine_tune_key.as_deref() {
+            builder = builder.fine_tune_api_key(fine_tune_key);
+        }
+        builder.build()
     }
+}
+
+impl CompletionClient for Client<reqwest::Client> {
+    type CompletionModel = CompletionModel<reqwest::Client>;
 
     /// Create a completion model with the given name.
     ///
@@ -101,36 +213,25 @@ impl Client {
     ///
     /// let gpt4 = galadriel.completion_model(galadriel::GPT_4);
     /// ```
-    pub fn completion_model(&self, model: &str) -> CompletionModel {
+    fn completion_model(&self, model: &str) -> CompletionModel<reqwest::Client> {
         CompletionModel::new(self.clone(), model)
     }
+}
 
-    /// Create an agent builder with the given completion model.
-    ///
-    /// # Example
-    /// ```
-    /// use rig::providers::galadriel::{Client, self};
-    ///
-    /// // Initialize the Galadriel client
-    /// let galadriel = Client::new("your-galadriel-api-key", None);
-    ///
-    /// let agent = galadriel.agent(galadriel::GPT_4)
-    ///    .preamble("You are comedian AI with a mission to make people laugh.")
-    ///    .temperature(0.0)
-    ///    .build();
-    /// ```
-    pub fn agent(&self, model: &str) -> AgentBuilder<CompletionModel> {
-        AgentBuilder::new(self.completion_model(model))
-    }
-
-    /// Create an extractor builder with the given completion model.
-    pub fn extractor<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync>(
-        &self,
-        model: &str,
-    ) -> ExtractorBuilder<T, CompletionModel> {
-        ExtractorBuilder::new(self.completion_model(model))
+impl VerifyClient for Client<reqwest::Client> {
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn verify(&self) -> Result<(), VerifyError> {
+        // Could not find an API endpoint to verify the API key
+        Ok(())
     }
 }
+
+impl_conversion_traits!(
+    AsEmbeddings,
+    AsTranscription,
+    AsImageGeneration,
+    AsAudioGeneration for Client<T>
+);
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
@@ -144,7 +245,7 @@ enum ApiResponse<T> {
     Err(ApiErrorResponse),
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
@@ -206,7 +307,7 @@ pub const GPT_35_TURBO_1106: &str = "gpt-3.5-turbo-1106";
 /// `gpt-3.5-turbo-instruct` completion model
 pub const GPT_35_TURBO_INSTRUCT: &str = "gpt-3.5-turbo-instruct";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String,
@@ -250,15 +351,25 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 "Response contained no message or tool call (empty)".to_owned(),
             )
         })?;
+        let usage = response
+            .usage
+            .as_ref()
+            .map(|usage| completion::Usage {
+                input_tokens: usage.prompt_tokens as u64,
+                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                total_tokens: usage.total_tokens as u64,
+            })
+            .unwrap_or_default();
 
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Choice {
     pub index: usize,
     pub message: Message,
@@ -296,6 +407,7 @@ impl TryFrom<Message> for message::Message {
                 ),
             }),
             "assistant" => Ok(Self::Assistant {
+                id: None,
                 content: OneOrMany::many(
                     tool_calls
                         .into_iter()
@@ -332,7 +444,7 @@ impl TryFrom<message::Message> for Message {
                 }),
                 tool_calls: vec![],
             }),
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 let mut text_content: Option<String> = None;
                 let mut tool_calls = vec![];
 
@@ -351,6 +463,11 @@ impl TryFrom<message::Message> for Message {
                         }
                         message::AssistantContent::ToolCall(tool_call) => {
                             tool_calls.push(tool_call.clone().into());
+                        }
+                        message::AssistantContent::Reasoning(_) => {
+                            return Err(MessageError::ConversionError(
+                                "Galadriel currently doesn't support reasoning.".into(),
+                            ));
                         }
                     }
                 }
@@ -387,13 +504,23 @@ pub struct Function {
 }
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    client: Client<T>,
     /// Name of the model (e.g.: gpt-3.5-turbo-1106)
     pub model: String,
 }
 
-impl CompletionModel {
+impl<T> CompletionModel<T>
+where
+    T: HttpClientExt,
+{
+    pub fn new(client: Client<T>, model: &str) -> Self {
+        Self {
+            client,
+            model: model.to_string(),
+        }
+    }
+
     pub(crate) fn create_completion_request(
         &self,
         completion_request: CompletionRequest,
@@ -423,6 +550,12 @@ impl CompletionModel {
                 .collect::<Result<Vec<Message>, _>>()?,
         );
 
+        let tool_choice = completion_request
+            .tool_choice
+            .clone()
+            .map(crate::providers::openai::completion::ToolChoice::try_from)
+            .transpose()?;
+
         let request = if completion_request.tools.is_empty() {
             json!({
                 "model": self.model,
@@ -435,7 +568,7 @@ impl CompletionModel {
                 "messages": full_history,
                 "temperature": completion_request.temperature,
                 "tools": completion_request.tools.into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
             })
         };
 
@@ -449,59 +582,88 @@ impl CompletionModel {
     }
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
-        Self {
-            client,
-            model: model.to_string(),
-        }
-    }
-}
-
-impl completion::CompletionModel for CompletionModel {
+impl completion::CompletionModel for CompletionModel<reqwest::Client> {
     type Response = CompletionResponse;
+    type StreamingResponse = openai::StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
+        let body = serde_json::to_vec(&request)?;
 
-        let response = self
+        let req = self
             .client
-            .post("/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
+            .post("/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(http_client::Error::from)?;
 
-        if response.status().is_success() {
-            let t = response.text().await?;
-            tracing::debug!(target: "rig", "Galadriel completion error: {}", t);
-
-            match serde_json::from_str::<ApiResponse<CompletionResponse>>(&t)? {
-                ApiResponse::Ok(response) => {
-                    tracing::info!(target: "rig",
-                        "Galadriel completion token usage: {:?}",
-                        response.usage.clone().map(|usage| format!("{usage}")).unwrap_or("N/A".to_string())
-                    );
-                    response.try_into()
-                }
-                ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "galadriel",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        async move {
+            let response = self.client.send(req).await?;
+
+            if response.status().is_success() {
+                let t = http_client::text(response).await?;
+                tracing::debug!(target: "rig::completions", "Galadriel completion response: {t}");
+
+                match serde_json::from_str::<ApiResponse<CompletionResponse>>(&t)? {
+                    ApiResponse::Ok(response) => {
+                        let span = tracing::Span::current();
+                        span.record("gen_ai.response.id", response.id.clone());
+                        span.record("gen_ai.response.model_name", response.model.clone());
+                        span.record(
+                            "gen_ai.output.messages",
+                            serde_json::to_string(&response.choices).unwrap(),
+                        );
+                        if let Some(ref usage) = response.usage {
+                            span.record("gen_ai.usage.input_tokens", usage.prompt_tokens);
+                            span.record(
+                                "gen_ai.usage.output_tokens",
+                                usage.total_tokens - usage.prompt_tokens,
+                            );
+                        }
+                        response.try_into()
+                    }
+                    ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
+                }
+            } else {
+                let text = http_client::text(response).await?;
+
+                Err(CompletionError::ProviderError(text))
+            }
         }
+        .instrument(span)
+        .await
     }
-}
 
-impl StreamingCompletionModel for CompletionModel {
-    type StreamingResponse = openai::StreamingCompletionResponse;
-
+    #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let preamble = request.preamble.clone();
         let mut request = self.create_completion_request(request)?;
 
         request = merge(
@@ -509,8 +671,33 @@ impl StreamingCompletionModel for CompletionModel {
             json!({"stream": true, "stream_options": {"include_usage": true}}),
         );
 
-        let builder = self.client.post("/chat/completions").json(&request);
+        let builder = self
+            .client
+            .reqwest_post("/chat/completions")
+            .header("Content-Type", "application/json")
+            .json(&request);
 
-        send_compatible_streaming_request(builder).await
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "galadriel",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(&request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        send_compatible_streaming_request(builder)
+            .instrument(span)
+            .await
     }
 }

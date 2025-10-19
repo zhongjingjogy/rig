@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.26...rig-qdrant-v0.1.27) - 2025-10-14
+
+### Added
+
+- *(rig-951)* generic HTTP client ([#875](https://github.com/0xPlaygrounds/rig/pull/875))
+
+### Fixed
+
+- trying to fix test regressions part 2 ([#913](https://github.com/0xPlaygrounds/rig/pull/913))
+
+## [0.1.26](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.25...rig-qdrant-v0.1.26) - 2025-09-29
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.25](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.24...rig-qdrant-v0.1.25) - 2025-09-15
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.1.24](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.23...rig-qdrant-v0.1.24) - 2025-09-02
+
+### Other
+
+- *(rig-907)* use where clause for trait bounds ([#749](https://github.com/0xPlaygrounds/rig/pull/749))
+
+## [0.1.23](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.22...rig-qdrant-v0.1.23) - 2025-08-20
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.22](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.21...rig-qdrant-v0.1.22) - 2025-08-19
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.21](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.20...rig-qdrant-v0.1.21) - 2025-08-19
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.20](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.19...rig-qdrant-v0.1.20) - 2025-08-05
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.19](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.18...rig-qdrant-v0.1.19) - 2025-08-05
+
+### Added
+
+- *(rig-845)* cosine similarity for vector search ([#664](https://github.com/0xPlaygrounds/rig/pull/664))
+
+## [0.1.18](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.17...rig-qdrant-v0.1.18) - 2025-07-30
+
+### Added
+
+- *(rig-819)* vector store index request struct ([#623](https://github.com/0xPlaygrounds/rig/pull/623))
+
+### Other
+
+- Refactor clients with builder pattern ([#615](https://github.com/0xPlaygrounds/rig/pull/615))
+
+## [0.1.17](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.16...rig-qdrant-v0.1.17) - 2025-07-16
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.16](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.15...rig-qdrant-v0.1.16) - 2025-07-14
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.1.15](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.14...rig-qdrant-v0.1.15) - 2025-07-07
+
+### Added
+
+- support inserting documents as a trait ([#563](https://github.com/0xPlaygrounds/rig/pull/563))
+
+### Other
+
+- Migrate all crates to Rust 2024 ([#539](https://github.com/0xPlaygrounds/rig/pull/539))
+- Declare shared dependencies in workspace ([#538](https://github.com/0xPlaygrounds/rig/pull/538))
+- Make clippy happy on all targets ([#542](https://github.com/0xPlaygrounds/rig/pull/542))
+
+## [0.1.14](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.13...rig-qdrant-v0.1.14) - 2025-06-09
+
+### Other
+
+- Introduce Client Traits and Testing ([#440](https://github.com/0xPlaygrounds/rig/pull/440))
+
 ## [0.1.13](https://github.com/0xPlaygrounds/rig/compare/rig-qdrant-v0.1.12...rig-qdrant-v0.1.13) - 2025-04-29
 
 ### Other

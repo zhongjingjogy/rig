@@ -7,10 +7,10 @@ use std::{
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
-use super::{VectorStoreError, VectorStoreIndex};
+use super::{VectorStoreError, VectorStoreIndex, request::VectorSearchRequest};
 use crate::{
-    embeddings::{distance::VectorDistance, Embedding, EmbeddingModel},
     OneOrMany,
+    embeddings::{Embedding, EmbeddingModel, distance::VectorDistance},
 };
 
 /// [InMemoryVectorStore] is a simple in-memory vector store that stores embeddings
@@ -39,7 +39,7 @@ impl<D: Serialize + Eq> InMemoryVectorStore<D> {
         Self { embeddings: store }
     }
 
-    /// Create a new [InMemoryVectorStore] from documents and and their corresponding embeddings with ids.
+    /// Create a new [InMemoryVectorStore] from documents and their corresponding embeddings with ids.
     pub fn from_documents_with_ids(
         documents: impl IntoIterator<Item = (impl ToString, D, OneOrMany<Embedding>)>,
     ) -> Self {
@@ -67,7 +67,7 @@ impl<D: Serialize + Eq> InMemoryVectorStore<D> {
 
     /// Implement vector search on [InMemoryVectorStore].
     /// To be used by implementations of [VectorStoreIndex::top_n] and [VectorStoreIndex::top_n_ids] methods.
-    fn vector_search(&self, prompt_embedding: &Embedding, n: usize) -> EmbeddingRanking<D> {
+    fn vector_search(&self, prompt_embedding: &Embedding, n: usize) -> EmbeddingRanking<'_, D> {
         // Sort documents by best embedding distance
         let mut docs = BinaryHeap::new();
 
@@ -221,15 +221,17 @@ impl<M: EmbeddingModel + Sync, D: Serialize + Sync + Send + Eq> VectorStoreIndex
 {
     async fn top_n<T: for<'a> Deserialize<'a>>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let prompt_embedding = &self.model.embed_text(query).await?;
+        let prompt_embedding = &self.model.embed_text(req.query()).await?;
 
-        let docs = self.store.vector_search(prompt_embedding, n);
+        let docs = self
+            .store
+            .vector_search(prompt_embedding, req.samples() as usize);
 
         // Return n best
         docs.into_iter()
+            // The distance should always be between 0 and 1, so distance should be fine to use as an absolute value
             .map(|Reverse(RankingItem(distance, id, doc, _))| {
                 Ok((
                     distance.0,
@@ -245,14 +247,14 @@ impl<M: EmbeddingModel + Sync, D: Serialize + Sync + Send + Eq> VectorStoreIndex
 
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let prompt_embedding = &self.model.embed_text(query).await?;
+        let prompt_embedding = &self.model.embed_text(req.query()).await?;
 
-        let docs = self.store.vector_search(prompt_embedding, n);
+        let docs = self
+            .store
+            .vector_search(prompt_embedding, req.samples() as usize);
 
-        // Return n best
         docs.into_iter()
             .map(|Reverse(RankingItem(distance, id, _, _))| Ok((distance.0, id.clone())))
             .collect::<Result<Vec<_>, _>>()
@@ -263,7 +265,7 @@ impl<M: EmbeddingModel + Sync, D: Serialize + Sync + Send + Eq> VectorStoreIndex
 mod tests {
     use std::cmp::Reverse;
 
-    use crate::{embeddings::embedding::Embedding, OneOrMany};
+    use crate::{OneOrMany, embeddings::embedding::Embedding};
 
     use super::{InMemoryVectorStore, RankingItem};
 

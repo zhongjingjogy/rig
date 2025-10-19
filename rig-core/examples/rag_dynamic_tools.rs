@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rig::prelude::*;
 use rig::{
     completion::{Prompt, ToolDefinition},
     embeddings::EmbeddingsBuilder,
@@ -8,7 +9,6 @@ use rig::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
 
 #[derive(Deserialize)]
 struct OperationArgs {
@@ -29,7 +29,6 @@ struct Add;
 
 impl Tool for Add {
     const NAME: &'static str = "add";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -54,39 +53,30 @@ impl Tool for Add {
         }))
         .expect("Tool Definition")
     }
-
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
 }
-
 impl ToolEmbedding for Add {
     type InitError = InitError;
     type Context = ();
     type State = ();
-
     fn init(_state: Self::State, _context: Self::Context) -> Result<Self, Self::InitError> {
         Ok(Add)
     }
-
     fn embedding_docs(&self) -> Vec<String> {
         vec!["Add x and y together".into()]
     }
-
     fn context(&self) -> Self::Context {}
 }
-
 #[derive(Deserialize, Serialize)]
 struct Subtract;
-
 impl Tool for Subtract {
     const NAME: &'static str = "subtract";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
-
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         serde_json::from_value(json!({
             "name": "subtract",
@@ -129,7 +119,6 @@ impl ToolEmbedding for Subtract {
         vec!["Subtract y from x (i.e.: x - y)".into()]
     }
 }
-
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // required to enable CloudWatch error logging by the runtime
@@ -140,16 +129,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .init();
 
     // Create OpenAI client
-    let openai_api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
-    let openai_client = Client::new(&openai_api_key);
-
+    let openai_client = Client::from_env();
     let embedding_model = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002);
-
     let toolset = ToolSet::builder()
         .dynamic_tool(Add)
         .dynamic_tool(Subtract)
         .build();
-
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
         .documents(toolset.schemas()?)?
         .build()
@@ -173,7 +158,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Prompt the agent and print the response
     let response = calculator_rag.prompt("Calculate 3 - 7").await?;
-    println!("{}", response);
+
+    println!("{response}");
 
     Ok(())
 }

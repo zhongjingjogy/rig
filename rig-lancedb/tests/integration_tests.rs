@@ -1,12 +1,13 @@
 use serde_json::json;
 
 use arrow_array::RecordBatchIterator;
-use fixture::{as_record_batch, schema, words, Word};
+use fixture::{Word, as_record_batch, schema, words};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use rig::{
+    client::EmbeddingsClient,
     embeddings::{EmbeddingModel, EmbeddingsBuilder},
     providers::openai,
-    vector_store::VectorStoreIndex,
+    vector_store::{VectorStoreIndex, request::VectorSearchRequest},
 };
 use rig_lancedb::{LanceDbVectorIndex, SearchParams};
 use std::sync::Arc;
@@ -30,9 +31,11 @@ async fn vector_search_test() {
         when.method(httpmock::Method::POST)
             .path("/embeddings")
             .header("Authorization", "Bearer TEST")
+            .header("Content-Type", "application/json")
             .json_body(json!({
                 "input": req_data,
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536
             }));
 
         let mut resp_data = vec![
@@ -75,11 +78,13 @@ async fn vector_search_test() {
         when.method(httpmock::Method::POST)
             .path("/embeddings")
             .header("Authorization", "Bearer TEST")
+            .header("Content-Type", "application/json")
             .json_body(json!({
                 "input": [
                     "My boss says I zindle too much, what does that mean?"
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -102,7 +107,9 @@ async fn vector_search_test() {
     });
 
     // Initialize OpenAI client
-    let openai_client = openai::Client::from_url("TEST", &server.base_url());
+    let openai_client = openai::Client::builder("TEST")
+        .base_url(&server.base_url())
+        .build();
 
     // Select an embedding model.
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
@@ -120,7 +127,7 @@ async fn vector_search_test() {
         .documents(
             (0..256)
                 .map(|i| Word {
-                    id: format!("doc{}", i),
+                    id: format!("doc{i}"),
                     definition: "Definition of *flumbuzzle (noun)*: A sudden, inexplicable urge to rearrange or reorganize small objects, such as desk items or books, for no apparent reason.".to_string()
                 })
         ).unwrap()
@@ -155,9 +162,16 @@ async fn vector_search_test() {
         .await
         .unwrap();
 
+    let query = "My boss says I zindle too much, what does that mean?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()
+        .expect("VectorSearchRequest should not fail to build here");
+
     // Query the index
     let results = vector_store_index
-        .top_n::<serde_json::Value>("My boss says I zindle too much, what does that mean?", 1)
+        .top_n::<serde_json::Value>(req)
         .await
         .unwrap();
 

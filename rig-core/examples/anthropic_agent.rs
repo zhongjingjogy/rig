@@ -1,17 +1,15 @@
-use std::env;
-
+use rig::prelude::*;
 use rig::{
     completion::Prompt,
     providers::anthropic::{self, CLAUDE_3_5_SONNET},
 };
+use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Create Anthropic client
-    let client = anthropic::ClientBuilder::new(
-        &env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY not set"),
-    )
-    .build();
+    let client =
+        anthropic::Client::new(&env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY not set"));
 
     // Create agent with a single context prompt
     let agent = client
@@ -24,7 +22,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let response = agent
         .prompt("When and where and what type is the next solar eclipse?")
         .await?;
-    println!("{}", response);
+
+    println!("{response}");
 
     Ok(())
 }

@@ -1,11 +1,14 @@
-use std::env;
+use rig::prelude::*;
 
 use rig::pipeline::agent_ops::extract;
+
 use rig::providers::openai::client::Client;
+
 use rig::{
     parallel,
-    pipeline::{self, passthrough, Op},
+    pipeline::{self, Op, passthrough},
 };
+
 use schemars::JsonSchema;
 
 #[derive(serde::Deserialize, JsonSchema, serde::Serialize)]
@@ -13,12 +16,10 @@ struct DocumentScore {
     /// The score of the document
     score: f32,
 }
-
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
-    let openai_api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
-    let openai_client = Client::new(&openai_api_key);
+    let openai_client = Client::from_env();
 
     let manipulation_agent = openai_client
         .extractor::<DocumentScore>("gpt-4")

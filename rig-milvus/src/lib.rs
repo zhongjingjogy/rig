@@ -2,7 +2,9 @@ use reqwest::StatusCode;
 use rig::{
     Embed, OneOrMany,
     embeddings::{Embedding, EmbeddingModel},
-    vector_store::{VectorStoreError, VectorStoreIndex},
+    vector_store::{
+        InsertDocuments, VectorStoreError, VectorStoreIndex, request::VectorSearchRequest,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,8 @@ struct SearchRequest<'a> {
     collection_name: &'a str,
     db_name: &'a str,
     data: Vec<f64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    filter: String,
     anns_field: &'a str,
     limit: usize,
     output_fields: Vec<&'a str>,
@@ -73,7 +77,10 @@ struct SearchResultDataOnlyId {
     distance: f64,
 }
 
-impl<M: EmbeddingModel> MilvusVectorStore<M> {
+impl<M> MilvusVectorStore<M>
+where
+    M: EmbeddingModel,
+{
     /// Creates a new instance of `MilvusVectorStore`.
     ///
     /// # Arguments
@@ -101,7 +108,7 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
     }
 
     /// Creates a Milvus insertion request.
-    fn create_insert_request(&self, data: Vec<CreateRecord>) -> InsertRequest {
+    fn create_insert_request(&self, data: Vec<CreateRecord>) -> InsertRequest<'_> {
         InsertRequest {
             data,
             collection_name: &self.collection_name,
@@ -110,11 +117,22 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
     }
 
     /// Creates a Milvus semantic search request.
-    fn create_search_request(&self, data: Vec<f64>, limit: usize) -> SearchRequest {
+    fn create_search_request(
+        &self,
+        data: Vec<f64>,
+        limit: usize,
+        threshold: Option<f64>,
+    ) -> SearchRequest<'_> {
+        let filter = if let Some(threshold) = threshold {
+            format!("distance >= {threshold}")
+        } else {
+            String::new()
+        };
         SearchRequest {
             collection_name: &self.collection_name,
             db_name: &self.database_name,
             data,
+            filter,
             anns_field: "embedding",
             limit,
             output_fields: vec!["id", "distance", "document", "embeddedText"],
@@ -122,19 +140,34 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
     }
 
     /// Creates a semantic search request, but only for IDs.
-    fn create_search_request_id_only(&self, data: Vec<f64>, limit: usize) -> SearchRequest {
+    fn create_search_request_id_only(
+        &self,
+        data: Vec<f64>,
+        limit: usize,
+        threshold: Option<f64>,
+    ) -> SearchRequest<'_> {
+        let filter = if let Some(threshold) = threshold {
+            format!("distance >= {threshold}")
+        } else {
+            String::new()
+        };
         SearchRequest {
             collection_name: &self.collection_name,
             db_name: &self.database_name,
             data,
+            filter,
             anns_field: "embedding",
             limit,
             output_fields: vec!["id", "distance"],
         }
     }
+}
 
-    /// Insert vectors (with metadata) into your Milvus instance.
-    pub async fn insert_documents<Doc: Serialize + Embed + Send>(
+impl<Model> InsertDocuments for MilvusVectorStore<Model>
+where
+    Model: EmbeddingModel + Send + Sync,
+{
+    async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, OneOrMany<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
@@ -191,21 +224,24 @@ impl<M: EmbeddingModel> MilvusVectorStore<M> {
     }
 }
 
-impl<M: EmbeddingModel> VectorStoreIndex for MilvusVectorStore<M> {
+impl<M> VectorStoreIndex for MilvusVectorStore<M>
+where
+    M: EmbeddingModel,
+{
     /// Search for the top `n` nearest neighbors to the given query within the Milvus vector store.
     /// Returns a vector of tuples containing the score, ID, and payload of the nearest neighbors.
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let embedding = self.model.embed_text(query).await?;
+        let embedding = self.model.embed_text(req.query()).await?;
         let url = format!(
             "{base_url}/v2/vectordb/entities/search",
             base_url = self.base_url
         );
 
-        let body = self.create_search_request(embedding.vec, n);
+        let body =
+            self.create_search_request(embedding.vec, req.samples() as usize, req.threshold());
 
         let mut client = self.client.post(url);
         if let Some(ref token) = self.token {
@@ -238,16 +274,19 @@ impl<M: EmbeddingModel> VectorStoreIndex for MilvusVectorStore<M> {
     /// Returns a vector of tuples containing the score and ID of the nearest neighbors.
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let embedding = self.model.embed_text(query).await?;
+        let embedding = self.model.embed_text(req.query()).await?;
         let url = format!(
             "{base_url}/v2/vectordb/entities/search",
             base_url = self.base_url
         );
 
-        let body = self.create_search_request_id_only(embedding.vec, n);
+        let body = self.create_search_request_id_only(
+            embedding.vec,
+            req.samples() as usize,
+            req.threshold(),
+        );
 
         let mut client = self.client.post(url);
         if let Some(ref token) = self.token {

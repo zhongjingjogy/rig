@@ -1,11 +1,13 @@
 use std::fmt::Display;
 
 use rig::{
-    embeddings::{Embedding, EmbeddingModel},
-    vector_store::{VectorStoreError, VectorStoreIndex},
     Embed, OneOrMany,
+    embeddings::{Embedding, EmbeddingModel},
+    vector_store::{
+        InsertDocuments, VectorStoreError, VectorStoreIndex, request::VectorSearchRequest,
+    },
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -69,7 +71,10 @@ impl SearchResult {
     }
 }
 
-impl<Model: EmbeddingModel> PostgresVectorStore<Model> {
+impl<Model> PostgresVectorStore<Model>
+where
+    Model: EmbeddingModel,
+{
     pub fn new(
         model: Model,
         pg_pool: PgPool,
@@ -88,29 +93,43 @@ impl<Model: EmbeddingModel> PostgresVectorStore<Model> {
         Self::new(model, pg_pool, None, PgVectorDistanceFunction::Cosine)
     }
 
-    fn search_query_full(&self) -> String {
-        self.search_query(true)
+    fn search_query_full(&self, threshold: Option<f64>) -> String {
+        self.search_query(true, threshold)
     }
-    fn search_query_only_ids(&self) -> String {
-        self.search_query(false)
+    fn search_query_only_ids(&self, threshold: Option<f64>) -> String {
+        self.search_query(false, threshold)
     }
 
-    fn search_query(&self, with_document: bool) -> String {
+    fn search_query(&self, with_document: bool, threshold: Option<f64>) -> String {
         let document = if with_document { ", document" } else { "" };
         format!(
             "
             SELECT id{}, distance FROM ( \
               SELECT DISTINCT ON (id) id{}, embedding {} $1 as distance \
               FROM {} \
+              {where_clause}
               ORDER BY id, distance \
             ) as d \
             ORDER BY distance \
             LIMIT $2",
-            document, document, self.distance_function, self.documents_table
+            document,
+            document,
+            self.distance_function,
+            self.documents_table,
+            where_clause = if let Some(threshold) = threshold {
+                format!("where distance > {threshold}")
+            } else {
+                String::new()
+            }
         )
     }
+}
 
-    pub async fn insert_documents<Doc: Serialize + Embed + Send>(
+impl<Model> InsertDocuments for PostgresVectorStore<Model>
+where
+    Model: EmbeddingModel + Send + Sync,
+{
+    async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, OneOrMany<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
@@ -143,17 +162,29 @@ impl<Model: EmbeddingModel> PostgresVectorStore<Model> {
     }
 }
 
-impl<Model: EmbeddingModel> VectorStoreIndex for PostgresVectorStore<Model> {
+impl<Model> VectorStoreIndex for PostgresVectorStore<Model>
+where
+    Model: EmbeddingModel,
+{
     /// Get the top n documents based on the distance to the given query.
     /// The result is a list of tuples of the form (score, id, document)
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
+        if req.samples() > i64::MAX as u64 {
+            return Err(VectorStoreError::DatastoreError(
+                format!(
+                    "The maximum amount of samples to return with the `rig` Postgres integration cannot be larger than {}",
+                    i64::MAX
+                )
+                .into(),
+            ));
+        }
+
         let embedded_query: pgvector::Vector = self
             .model
-            .embed_text(query)
+            .embed_text(req.query())
             .await?
             .vec
             .iter()
@@ -161,12 +192,13 @@ impl<Model: EmbeddingModel> VectorStoreIndex for PostgresVectorStore<Model> {
             .collect::<Vec<f32>>()
             .into();
 
-        let rows: Vec<SearchResult> = sqlx::query_as(self.search_query_full().as_str())
-            .bind(embedded_query)
-            .bind(n as i64)
-            .fetch_all(&self.pg_pool)
-            .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+        let rows: Vec<SearchResult> =
+            sqlx::query_as(self.search_query_full(req.threshold()).as_str())
+                .bind(embedded_query)
+                .bind(req.samples() as i64)
+                .fetch_all(&self.pg_pool)
+                .await
+                .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
 
         let rows: Vec<(f64, String, T)> = rows
             .into_iter()
@@ -179,12 +211,20 @@ impl<Model: EmbeddingModel> VectorStoreIndex for PostgresVectorStore<Model> {
     /// Same as `top_n` but returns the document ids only.
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
+        if req.samples() > i64::MAX as u64 {
+            return Err(VectorStoreError::DatastoreError(
+                format!(
+                    "The maximum amount of samples to return with the `rig` Postgres integration cannot be larger than {}",
+                    i64::MAX
+                )
+                .into(),
+            ));
+        }
         let embedded_query: pgvector::Vector = self
             .model
-            .embed_text(query)
+            .embed_text(req.query())
             .await?
             .vec
             .iter()
@@ -192,12 +232,13 @@ impl<Model: EmbeddingModel> VectorStoreIndex for PostgresVectorStore<Model> {
             .collect::<Vec<f32>>()
             .into();
 
-        let rows: Vec<SearchResultOnlyId> = sqlx::query_as(self.search_query_only_ids().as_str())
-            .bind(embedded_query)
-            .bind(n as i64)
-            .fetch_all(&self.pg_pool)
-            .await
-            .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+        let rows: Vec<SearchResultOnlyId> =
+            sqlx::query_as(self.search_query_only_ids(req.threshold()).as_str())
+                .bind(embedded_query)
+                .bind(req.samples() as i64)
+                .fetch_all(&self.pg_pool)
+                .await
+                .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
 
         let rows: Vec<(f64, String)> = rows
             .into_iter()

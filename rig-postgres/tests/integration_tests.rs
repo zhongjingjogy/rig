@@ -1,12 +1,18 @@
-use rig::{embeddings::EmbeddingsBuilder, vector_store::VectorStoreIndex, Embed};
+use rig::client::EmbeddingsClient;
+use rig::vector_store::request::VectorSearchRequest;
+use rig::{
+    Embed,
+    embeddings::EmbeddingsBuilder,
+    vector_store::{InsertDocuments, VectorStoreIndex},
+};
 use rig_postgres::PostgresVectorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -29,7 +35,7 @@ async fn vector_search_test() {
         .await
         .expect("Error getting docker port");
 
-    println!("Container started on host:port {}:{}", host, port);
+    println!("Container started on host:port {host}:{port}");
 
     // connect to Postgres
     let pg_pool = connect_to_postgres(host, port).await;
@@ -44,7 +50,9 @@ async fn vector_search_test() {
 
     // init fake openai service
     let openai_mock = create_openai_mock_service().await;
-    let openai_client = rig::providers::openai::Client::from_url("TEST", &openai_mock.base_url());
+    let openai_client = rig::providers::openai::Client::builder("TEST")
+        .base_url(&openai_mock.base_url())
+        .build();
 
     let model = openai_client.embedding_model(rig::providers::openai::TEXT_EMBEDDING_ADA_002);
 
@@ -89,9 +97,16 @@ async fn vector_search_test() {
 
     assert_eq!(documents_count, 3);
 
+    let query = "What does \"glarb-glarb\" mean?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()
+        .expect("VectorSearchRequest should build");
+
     // search for a document
     let results = vector_store
-        .top_n::<Word>("What does \"glarb-glarb\" mean?", 1)
+        .top_n::<Word>(req.clone())
         .await
         .expect("Failed to search for document");
 
@@ -103,16 +118,13 @@ async fn vector_search_test() {
     );
 
     let (distance, full_query_id, doc) = results[0].clone();
-    println!(
-        "Distance: {}, id: {}, document: {:?}",
-        distance, full_query_id, doc
-    );
+    println!("Distance: {distance}, id: {full_query_id}, document: {doc:?}");
 
     assert_eq!(doc.name, "glarb-glarb");
 
     // search only ids
     let results = vector_store
-        .top_n_ids("What does \"glarb-glarb\" mean?", 1)
+        .top_n_ids(req)
         .await
         .expect("Failed to search for document ids");
 
@@ -124,7 +136,7 @@ async fn vector_search_test() {
     );
 
     let (distance, id) = results[0].clone();
-    println!("Distance: {}, id: {}", distance, id);
+    println!("Distance: {distance}, id: {id}");
 
     assert_eq!(id, full_query_id);
 }
@@ -149,10 +161,7 @@ async fn connect_to_postgres(host: String, port: u16) -> PgPool {
     PgPoolOptions::new()
         .max_connections(50)
         .idle_timeout(std::time::Duration::from_secs(5))
-        .connect(&format!(
-            "postgres://postgres:postgres@{}:{}/rig",
-            host, port
-        ))
+        .connect(&format!("postgres://postgres:postgres@{host}:{port}/rig"))
         .await
         .expect("Failed to create postgres pool")
 }
@@ -171,6 +180,7 @@ async fn create_openai_mock_service() -> httpmock::MockServer {
                     "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -210,6 +220,7 @@ async fn create_openai_mock_service() -> httpmock::MockServer {
                     "What does \"glarb-glarb\" mean?"
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")

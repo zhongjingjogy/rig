@@ -1,4 +1,11 @@
-use rig::{Embed, embeddings::EmbeddingsBuilder, vector_store::VectorStoreIndex};
+use rig::vector_store::InsertDocuments;
+use rig::vector_store::request::VectorSearchRequest;
+use rig::{
+    Embed,
+    client::{EmbeddingsClient, ProviderClient},
+    embeddings::EmbeddingsBuilder,
+    vector_store::VectorStoreIndex,
+};
 use serde::{Deserialize, Serialize};
 
 // A vector search needs to be performed on the `definitions` field, so we derive the `Embed` trait for `WordDefinition`
@@ -65,11 +72,17 @@ async fn main() -> Result<(), anyhow::Error> {
     // query vector
     let query = "What does \"glarb-glarb\" mean?";
 
-    let results = vector_store.top_n::<WordDefinition>(query, 2).await?;
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(2)
+        .build()
+        .expect("VectorSearchRequest should not fail to build here");
+
+    let results = vector_store.top_n::<WordDefinition>(req).await?;
 
     println!("#{} results for query: {}", results.len(), query);
     for (distance, _id, doc) in results.iter() {
-        println!("Result distance {} for word: {}", distance, doc);
+        println!("Result distance {distance} for word: {doc}");
 
         // expected output
         // Result distance 0.693218142100547 for word: glarb-glarb

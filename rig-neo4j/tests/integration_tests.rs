@@ -1,18 +1,19 @@
 use serde_json::json;
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 
 use futures::{StreamExt, TryStreamExt};
 use rig::vector_store::VectorStoreIndex;
 use rig::{
+    Embed, OneOrMany,
     embeddings::{Embedding, EmbeddingsBuilder},
     providers::openai,
-    Embed, OneOrMany,
 };
-use rig_neo4j::{vector_index::SearchParams, Neo4jClient, ToBoltType};
+use rig::{client::EmbeddingsClient, vector_store::request::VectorSearchRequest};
+use rig_neo4j::{Neo4jClient, ToBoltType, vector_index::SearchParams};
 
 const BOLT_PORT: u16 = 7687;
 const HTTP_PORT: u16 = 7474;
@@ -52,6 +53,7 @@ async fn vector_search_test() {
         when.method(httpmock::Method::POST)
             .path("/embeddings")
             .header("Authorization", "Bearer TEST")
+            .header("Content-Type", "application/json")
             .json_body(json!({
                 "input": [
                     "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets",
@@ -59,6 +61,7 @@ async fn vector_search_test() {
                     "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -93,11 +96,13 @@ async fn vector_search_test() {
         when.method(httpmock::Method::POST)
             .path("/embeddings")
             .header("Authorization", "Bearer TEST")
+            .header("Content-Type", "application/json")
             .json_body(json!({
                 "input": [
                     "What is a glarb?",
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -120,7 +125,9 @@ async fn vector_search_test() {
     });
 
     // Initialize OpenAI client
-    let openai_client = openai::Client::from_url("TEST", &server.base_url());
+    let openai_client = openai::Client::builder("TEST")
+        .base_url(&server.base_url())
+        .build();
 
     // Select the embedding model and generate our embeddings
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
@@ -180,7 +187,7 @@ async fn vector_search_test() {
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
 
-    println!("Index exists: {:?}", index_exists);
+    println!("Index exists: {index_exists:?}");
 
     // Create a vector index on our vector store
     // IMPORTANT: Reuse the same model that was used to generate the embeddings
@@ -189,11 +196,15 @@ async fn vector_search_test() {
         .await
         .expect("");
 
+    let query = "What is a glarb?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()
+        .expect("VectorSearchRequest should not fail to build here");
+
     // Query the index
-    let results = index
-        .top_n::<serde_json::Value>("What is a glarb?", 1)
-        .await
-        .expect("");
+    let results = index.top_n::<serde_json::Value>(req).await.expect("");
 
     let (_, _, value) = &results.first().expect("");
 

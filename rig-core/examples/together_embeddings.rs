@@ -1,5 +1,6 @@
-use rig::providers::together;
 use rig::Embed;
+use rig::prelude::*;
+use rig::providers::together;
 
 #[derive(Embed, Debug)]
 struct Greetings {
@@ -11,7 +12,6 @@ struct Greetings {
 async fn main() -> Result<(), anyhow::Error> {
     // Initialize the together client
     let client = together::Client::from_env();
-
     let embeddings = client
         .embeddings(together::embedding::M2_BERT_80M_8K_RETRIEVAL)
         .document(Greetings {
@@ -24,7 +24,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         .expect("Failed to embed documents");
 
-    println!("{:?}", embeddings);
+    println!("{embeddings:?}");
 
     Ok(())
 }

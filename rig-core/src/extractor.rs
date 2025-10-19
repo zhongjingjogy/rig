@@ -30,15 +30,16 @@
 
 use std::marker::PhantomData;
 
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    agent::{Agent, AgentBuilder},
+    agent::{Agent, AgentBuilder, AgentBuilderSimple},
     completion::{Completion, CompletionError, CompletionModel, ToolDefinition},
-    message::{AssistantContent, Message, ToolCall, ToolFunction},
+    message::{AssistantContent, Message, ToolCall, ToolChoice, ToolFunction},
     tool::Tool,
+    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
 const SUBMIT_TOOL_NAME: &str = "submit";
@@ -56,17 +57,108 @@ pub enum ExtractionError {
 }
 
 /// Extractor for structured data from text
-pub struct Extractor<M: CompletionModel, T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync> {
+pub struct Extractor<M, T>
+where
+    M: CompletionModel,
+    T: JsonSchema + for<'a> Deserialize<'a> + WasmCompatSend + WasmCompatSync,
+{
     agent: Agent<M>,
     _t: PhantomData<T>,
+    retries: u64,
 }
 
-impl<T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync, M: CompletionModel> Extractor<M, T>
+impl<M, T> Extractor<M, T>
 where
-    M: Sync,
+    M: CompletionModel,
+    T: JsonSchema + for<'a> Deserialize<'a> + WasmCompatSend + WasmCompatSync,
 {
-    pub async fn extract(&self, text: impl Into<Message> + Send) -> Result<T, ExtractionError> {
-        let response = self.agent.completion(text, vec![]).await?.send().await?;
+    /// Attempts to extract data from the given text with a number of retries.
+    ///
+    /// The function will retry the extraction if the initial attempt fails or
+    /// if the model does not call the `submit` tool.
+    ///
+    /// The number of retries is determined by the `retries` field on the Extractor struct.
+    pub async fn extract(
+        &self,
+        text: impl Into<Message> + WasmCompatSend,
+    ) -> Result<T, ExtractionError> {
+        let mut last_error = None;
+        let text_message = text.into();
+
+        for i in 0..=self.retries {
+            tracing::debug!(
+                "Attempting to extract JSON. Retries left: {retries}",
+                retries = self.retries - i
+            );
+            let attempt_text = text_message.clone();
+            match self.extract_json(attempt_text, vec![]).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::warn!("Attempt {i} to extract JSON failed: {e:?}. Retrying...");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // If the loop finishes without a successful extraction, return the last error encountered.
+        Err(last_error.unwrap_or(ExtractionError::NoData))
+    }
+
+    /// Attempts to extract data from the given text with a number of retries.
+    ///
+    /// The function will retry the extraction if the initial attempt fails or
+    /// if the model does not call the `submit` tool.
+    ///
+    /// The number of retries is determined by the `retries` field on the Extractor struct.
+    pub async fn extract_with_chat_history(
+        &self,
+        text: impl Into<Message> + WasmCompatSend,
+        chat_history: Vec<Message>,
+    ) -> Result<T, ExtractionError> {
+        let mut last_error = None;
+        let text_message = text.into();
+
+        for i in 0..=self.retries {
+            tracing::debug!(
+                "Attempting to extract JSON. Retries left: {retries}",
+                retries = self.retries - i
+            );
+            let attempt_text = text_message.clone();
+            match self.extract_json(attempt_text, chat_history.clone()).await {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    tracing::warn!("Attempt {i} to extract JSON failed: {e:?}. Retrying...");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // If the loop finishes without a successful extraction, return the last error encountered.
+        Err(last_error.unwrap_or(ExtractionError::NoData))
+    }
+
+    async fn extract_json(
+        &self,
+        text: impl Into<Message> + WasmCompatSend,
+        messages: Vec<Message>,
+    ) -> Result<T, ExtractionError> {
+        let response = self.agent.completion(text, messages).await?.send().await?;
+
+        if !response.choice.iter().any(|x| {
+            let AssistantContent::ToolCall(ToolCall {
+                function: ToolFunction { name, .. },
+                ..
+            }) = x
+            else {
+                return false;
+            };
+
+            name == SUBMIT_TOOL_NAME
+        }) {
+            tracing::warn!(
+                "The submit tool was not called. If this happens more than once, please ensure the model you are using is powerful enough to reliably call tools."
+            );
+        }
 
         let arguments = response
             .choice
@@ -103,19 +195,31 @@ where
 
         Ok(serde_json::from_value(raw_data)?)
     }
+
+    pub async fn get_inner(&self) -> &Agent<M> {
+        &self.agent
+    }
+
+    pub async fn into_inner(self) -> Agent<M> {
+        self.agent
+    }
 }
 
 /// Builder for the Extractor
-pub struct ExtractorBuilder<
-    T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync + 'static,
+pub struct ExtractorBuilder<M, T>
+where
     M: CompletionModel,
-> {
-    agent_builder: AgentBuilder<M>,
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync + 'static,
+{
+    agent_builder: AgentBuilderSimple<M>,
     _t: PhantomData<T>,
+    retries: Option<u64>,
 }
 
-impl<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync, M: CompletionModel>
-    ExtractorBuilder<T, M>
+impl<M, T> ExtractorBuilder<M, T>
+where
+    M: CompletionModel,
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync + 'static,
 {
     pub fn new(model: M) -> Self {
         Self {
@@ -126,7 +230,9 @@ impl<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync, M: Compl
                     Use the `submit` function to submit the structured data.\n\
                     Be sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.
                 ")
-                .tool(SubmitTool::<T> {_t: PhantomData}),
+                .tool(SubmitTool::<T> {_t: PhantomData})
+                .tool_choice(ToolChoice::Required),
+            retries: None,
             _t: PhantomData,
         }
     }
@@ -145,17 +251,44 @@ impl<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync, M: Compl
         self
     }
 
+    pub fn additional_params(mut self, params: serde_json::Value) -> Self {
+        self.agent_builder = self.agent_builder.additional_params(params);
+        self
+    }
+
+    /// Set the maximum number of tokens for the completion
+    pub fn max_tokens(mut self, max_tokens: u64) -> Self {
+        self.agent_builder = self.agent_builder.max_tokens(max_tokens);
+        self
+    }
+
+    /// Set the maximum number of retries for the extractor.
+    pub fn retries(mut self, retries: u64) -> Self {
+        self.retries = Some(retries);
+        self
+    }
+
+    /// Set the `tool_choice` option for the inner Agent.
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.agent_builder = self.agent_builder.tool_choice(choice);
+        self
+    }
+
     /// Build the Extractor
     pub fn build(self) -> Extractor<M, T> {
         Extractor {
             agent: self.agent_builder.build(),
             _t: PhantomData,
+            retries: self.retries.unwrap_or(0),
         }
     }
 }
 
 #[derive(Deserialize, Serialize)]
-struct SubmitTool<T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync> {
+struct SubmitTool<T>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
+{
     _t: PhantomData<T>,
 }
 
@@ -163,7 +296,10 @@ struct SubmitTool<T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync> {
 #[error("SubmitError")]
 struct SubmitError;
 
-impl<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync> Tool for SubmitTool<T> {
+impl<T> Tool for SubmitTool<T>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
+{
     const NAME: &'static str = SUBMIT_TOOL_NAME;
     type Error = SubmitError;
     type Args = T;

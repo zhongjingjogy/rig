@@ -1,3 +1,4 @@
+use rig::prelude::*;
 use rig::providers::openai;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,5 +32,5 @@ async fn main() {
         .await
         .expect("Failed to extract sentiment");
 
-    println!("GPT-4: {:?}", sentiment);
+    println!("GPT-4: {sentiment:?}");
 }

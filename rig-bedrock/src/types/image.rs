@@ -2,10 +2,10 @@ use aws_sdk_bedrockruntime::types as aws_bedrock;
 
 use rig::{
     completion::CompletionError,
-    message::{ContentFormat, Image, ImageMediaType, MimeType},
+    message::{DocumentSourceKind, Image, ImageMediaType, MimeType},
 };
 
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 
 #[derive(Clone)]
 pub struct RigImage(pub Image);
@@ -32,8 +32,14 @@ impl TryFrom<RigImage> for aws_bedrock::ImageBlock {
             None => Ok(None),
         }?;
 
+        let DocumentSourceKind::Base64(data) = image.0.data else {
+            return Err(CompletionError::RequestError(
+                "Only base64 encoded strings are allowed for image input on AWS Bedrock".into(),
+            ));
+        };
+
         let img_data = BASE64_STANDARD
-            .decode(image.0.data)
+            .decode(data)
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
         let blob = aws_smithy_types::Blob::new(img_data);
         let result = aws_bedrock::ImageBlock::builder()
@@ -55,8 +61,7 @@ impl TryFrom<aws_bedrock::ImageBlock> for RigImage {
             aws_bedrock::ImageFormat::Png => Ok(ImageMediaType::PNG),
             aws_bedrock::ImageFormat::Webp => Ok(ImageMediaType::WEBP),
             e => Err(CompletionError::ProviderError(format!(
-                "Unsupported format {}",
-                e
+                "Unsupported format {e}"
             ))),
         }?;
 
@@ -70,10 +75,10 @@ impl TryFrom<aws_bedrock::ImageBlock> for RigImage {
             )),
         }?;
         Ok(RigImage(Image {
-            data,
-            format: Some(ContentFormat::Base64),
+            data: DocumentSourceKind::Base64(data),
             media_type: Some(media_type),
             detail: None,
+            additional_params: None,
         }))
     }
 }
@@ -81,27 +86,31 @@ impl TryFrom<aws_bedrock::ImageBlock> for RigImage {
 #[cfg(test)]
 mod tests {
     use aws_sdk_bedrockruntime::types as aws_bedrock;
-    use base64::{prelude::BASE64_STANDARD, Engine};
+    use base64::{Engine, prelude::BASE64_STANDARD};
     use rig::{
         completion::CompletionError,
-        message::{ContentFormat, Image, ImageMediaType},
+        message::{DocumentSourceKind, Image, ImageMediaType},
     };
 
     use crate::types::image::RigImage;
 
     #[test]
     fn test_image_to_aws_image() {
+        let encoded_str = BASE64_STANDARD.encode("img_data");
         let rig_image = RigImage(Image {
-            data: BASE64_STANDARD.encode("img_data"),
-            format: Some(ContentFormat::Base64),
+            data: DocumentSourceKind::Base64(encoded_str),
             media_type: Some(ImageMediaType::JPEG),
             detail: None,
+            additional_params: None,
         });
         let aws_image: Result<aws_bedrock::ImageBlock, _> = rig_image.clone().try_into();
-        assert_eq!(aws_image.is_ok(), true);
+        assert!(aws_image.is_ok());
         let aws_image = aws_image.unwrap();
         assert_eq!(aws_image.format, aws_bedrock::ImageFormat::Jpeg);
-        let img_data = BASE64_STANDARD.decode(rig_image.0.data).unwrap();
+        let DocumentSourceKind::Base64(data) = rig_image.0.data else {
+            panic!("This shouldn't fail since AWS Bedrock only supports base64 encoded strings!")
+        };
+        let img_data = BASE64_STANDARD.decode(data).unwrap();
         let aws_image_bytes = aws_image
             .source()
             .unwrap()
@@ -114,11 +123,12 @@ mod tests {
 
     #[test]
     fn test_unsupported_image_to_aws_image() {
+        let encoded_str = BASE64_STANDARD.encode("img_data");
         let rig_image = RigImage(Image {
-            data: BASE64_STANDARD.encode("img_data"),
-            format: Some(ContentFormat::Base64),
+            data: DocumentSourceKind::Base64(encoded_str),
             media_type: Some(ImageMediaType::HEIC),
             detail: None,
+            additional_params: None,
         });
         let aws_image: Result<aws_bedrock::ImageBlock, _> = rig_image.clone().try_into();
         assert_eq!(

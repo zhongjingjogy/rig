@@ -1,11 +1,16 @@
+//! Everything related to audio generation (ie, Text To Speech).
+//! Rig abstracts over a number of different providers using the [AudioGenerationModel] trait.
+use crate::{client::audio_generation::AudioGenerationModelHandle, http_client};
+use futures::future::BoxFuture;
 use serde_json::Value;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AudioGenerationError {
     /// Http error (e.g.: connection error, timeout, etc.)
     #[error("HttpError: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(#[from] http_client::Error),
 
     /// Json error (e.g.: serialization, deserialization)
     #[error("JsonError: {0}")]
@@ -23,7 +28,10 @@ pub enum AudioGenerationError {
     #[error("ProviderError: {0}")]
     ProviderError(String),
 }
-pub trait AudioGeneration<M: AudioGenerationModel> {
+pub trait AudioGeneration<M>
+where
+    M: AudioGenerationModel,
+{
     /// Generates an audio generation request builder for the given `text` and `voice`.
     /// This function is meant to be called by the user to further customize the
     /// request at generation time before sending it.
@@ -61,6 +69,45 @@ pub trait AudioGenerationModel: Clone + Send + Sync {
     }
 }
 
+pub trait AudioGenerationModelDyn: Send + Sync {
+    fn audio_generation(
+        &self,
+        request: AudioGenerationRequest,
+    ) -> BoxFuture<'_, Result<AudioGenerationResponse<()>, AudioGenerationError>>;
+
+    fn audio_generation_request(
+        &self,
+    ) -> AudioGenerationRequestBuilder<AudioGenerationModelHandle<'_>>;
+}
+
+impl<T> AudioGenerationModelDyn for T
+where
+    T: AudioGenerationModel,
+{
+    fn audio_generation(
+        &self,
+        request: AudioGenerationRequest,
+    ) -> BoxFuture<'_, Result<AudioGenerationResponse<()>, AudioGenerationError>> {
+        Box::pin(async move {
+            let resp = self.audio_generation(request).await;
+
+            resp.map(|r| AudioGenerationResponse {
+                audio: r.audio,
+                response: (),
+            })
+        })
+    }
+
+    fn audio_generation_request(
+        &self,
+    ) -> AudioGenerationRequestBuilder<AudioGenerationModelHandle<'_>> {
+        AudioGenerationRequestBuilder::new(AudioGenerationModelHandle {
+            inner: Arc::new(self.clone()),
+        })
+    }
+}
+
+#[non_exhaustive]
 pub struct AudioGenerationRequest {
     pub text: String,
     pub voice: String,
@@ -68,7 +115,11 @@ pub struct AudioGenerationRequest {
     pub additional_params: Option<Value>,
 }
 
-pub struct AudioGenerationRequestBuilder<M: AudioGenerationModel> {
+#[non_exhaustive]
+pub struct AudioGenerationRequestBuilder<M>
+where
+    M: AudioGenerationModel,
+{
     model: M,
     text: String,
     voice: String,
@@ -76,7 +127,10 @@ pub struct AudioGenerationRequestBuilder<M: AudioGenerationModel> {
     additional_params: Option<Value>,
 }
 
-impl<M: AudioGenerationModel> AudioGenerationRequestBuilder<M> {
+impl<M> AudioGenerationRequestBuilder<M>
+where
+    M: AudioGenerationModel,
+{
     pub fn new(model: M) -> Self {
         Self {
             model,

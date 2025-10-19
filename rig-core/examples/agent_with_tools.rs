@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rig::prelude::*;
 use rig::{
     completion::{Prompt, ToolDefinition},
     providers,
@@ -21,7 +22,6 @@ struct MathError;
 struct Adder;
 impl Tool for Adder {
     const NAME: &'static str = "add";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -41,7 +41,8 @@ impl Tool for Adder {
                         "type": "number",
                         "description": "The second number to add"
                     }
-                }
+                },
+                "required": ["x", "y"],
             }),
         }
     }
@@ -55,9 +56,9 @@ impl Tool for Adder {
 
 #[derive(Deserialize, Serialize)]
 struct Subtract;
+
 impl Tool for Subtract {
     const NAME: &'static str = "subtract";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -77,8 +78,9 @@ impl Tool for Subtract {
                         "type": "number",
                         "description": "The number to subtract"
                     }
-                }
-            }
+                },
+                "required": ["x", "y"],
+            },
         }))
         .expect("Tool Definition")
     }
@@ -111,6 +113,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Prompt the agent and print the response
     println!("Calculate 2 - 5");
+
     println!(
         "OpenAI Calculator Agent: {}",
         calculator_agent.prompt("Calculate 2 - 5").await?

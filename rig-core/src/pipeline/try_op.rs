@@ -4,21 +4,23 @@ use futures::stream;
 #[allow(unused_imports)] // Needed since this is used in a macro rule
 use futures::try_join;
 
+use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
+
 use super::op::{self};
 
 // ================================================================
 // Core TryOp trait
 // ================================================================
-pub trait TryOp: Send + Sync {
-    type Input: Send + Sync;
-    type Output: Send + Sync;
-    type Error: Send + Sync;
+pub trait TryOp: WasmCompatSend + WasmCompatSync {
+    type Input: WasmCompatSend + WasmCompatSync;
+    type Output: WasmCompatSend + WasmCompatSync;
+    type Error: WasmCompatSend + WasmCompatSync;
 
     /// Execute the current op with the given input.
     fn try_call(
         &self,
         input: Self::Input,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + WasmCompatSend;
 
     /// Execute the current op with the given inputs. `n` is the number of concurrent
     /// inputs that will be processed concurrently.
@@ -40,10 +42,10 @@ pub trait TryOp: Send + Sync {
         &self,
         n: usize,
         input: I,
-    ) -> impl Future<Output = Result<Vec<Self::Output>, Self::Error>> + Send
+    ) -> impl Future<Output = Result<Vec<Self::Output>, Self::Error>> + WasmCompatSend
     where
-        I: IntoIterator<Item = Self::Input> + Send,
-        I::IntoIter: Send,
+        I: IntoIterator<Item = Self::Input> + WasmCompatSend,
+        I::IntoIter: WasmCompatSend,
         Self: Sized,
     {
         use stream::{StreamExt, TryStreamExt};
@@ -73,8 +75,8 @@ pub trait TryOp: Send + Sync {
     /// ```
     fn map_ok<F, Output>(self, f: F) -> MapOk<Self, op::Map<F, Self::Output>>
     where
-        F: Fn(Self::Output) -> Output + Send + Sync,
-        Output: Send + Sync,
+        F: Fn(Self::Output) -> Output + WasmCompatSend + WasmCompatSync,
+        Output: WasmCompatSend + WasmCompatSync,
         Self: Sized,
     {
         MapOk::new(self, op::Map::new(f))
@@ -96,8 +98,8 @@ pub trait TryOp: Send + Sync {
     /// ```
     fn map_err<F, E>(self, f: F) -> MapErr<Self, op::Map<F, Self::Error>>
     where
-        F: Fn(Self::Error) -> E + Send + Sync,
-        E: Send + Sync,
+        F: Fn(Self::Error) -> E + WasmCompatSend + WasmCompatSync,
+        E: WasmCompatSend + WasmCompatSync,
         Self: Sized,
     {
         MapErr::new(self, op::Map::new(f))
@@ -120,9 +122,9 @@ pub trait TryOp: Send + Sync {
     /// ```
     fn and_then<F, Fut, Output>(self, f: F) -> AndThen<Self, op::Then<F, Self::Output>>
     where
-        F: Fn(Self::Output) -> Fut + Send + Sync,
-        Fut: Future<Output = Result<Output, Self::Error>> + Send + Sync,
-        Output: Send + Sync,
+        F: Fn(Self::Output) -> Fut + WasmCompatSend + WasmCompatSync,
+        Fut: Future<Output = Result<Output, Self::Error>> + WasmCompatSend + WasmCompatSync,
+        Output: WasmCompatSend + WasmCompatSync,
         Self: Sized,
     {
         AndThen::new(self, op::Then::new(f))
@@ -145,9 +147,9 @@ pub trait TryOp: Send + Sync {
     /// ```
     fn or_else<F, Fut, E>(self, f: F) -> OrElse<Self, op::Then<F, Self::Error>>
     where
-        F: Fn(Self::Error) -> Fut + Send + Sync,
-        Fut: Future<Output = Result<Self::Output, E>> + Send + Sync,
-        E: Send + Sync,
+        F: Fn(Self::Error) -> Fut + WasmCompatSend + WasmCompatSync,
+        Fut: Future<Output = Result<Self::Output, E>> + WasmCompatSend + WasmCompatSync,
+        E: WasmCompatSend + WasmCompatSync,
         Self: Sized,
     {
         OrElse::new(self, op::Then::new(f))
@@ -191,8 +193,8 @@ pub trait TryOp: Send + Sync {
 impl<Op, T, E> TryOp for Op
 where
     Op: super::Op<Output = Result<T, E>>,
-    T: Send + Sync,
-    E: Send + Sync,
+    T: WasmCompatSend + WasmCompatSync,
+    E: WasmCompatSend + WasmCompatSync,
 {
     type Input = Op::Input;
     type Output = T;
@@ -410,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_map_err_constructor() {
         let op1 = map(|x: i32| if x % 2 == 0 { Ok(x) } else { Err("x is odd") });
-        let op2 = then(|err: &str| async move { format!("Error: {}", err) });
+        let op2 = then(|err: &str| async move { format!("Error: {err}") });
         let op3 = map(|err: String| err.len());
 
         let pipeline = MapErr::new(MapErr::new(op1, op2), op3);
@@ -422,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_map_err_chain() {
         let pipeline = map(|x: i32| if x % 2 == 0 { Ok(x) } else { Err("x is odd") })
-            .map_err(|err| format!("Error: {}", err))
+            .map_err(|err| format!("Error: {err}"))
             .map_err(|err| err.len());
 
         let result = pipeline.try_call(1).await;
@@ -454,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn test_or_else_constructor() {
         let op1 = map(|x: i32| if x % 2 == 0 { Ok(x) } else { Err("x is odd") });
-        let op2 = then(|err: &str| async move { Err(format!("Error: {}", err)) });
+        let op2 = then(|err: &str| async move { Err(format!("Error: {err}")) });
         let op3 = map(|err: String| Ok::<i32, String>(err.len() as i32));
 
         let pipeline = OrElse::new(OrElse::new(op1, op2), op3);
@@ -466,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn test_or_else_chain() {
         let pipeline = map(|x: i32| if x % 2 == 0 { Ok(x) } else { Err("x is odd") })
-            .or_else(|err| async move { Err(format!("Error: {}", err)) })
+            .or_else(|err| async move { Err(format!("Error: {err}")) })
             .or_else(|err| async move { Ok::<i32, String>(err.len() as i32) });
 
         let result = pipeline.try_call(1).await.unwrap();

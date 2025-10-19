@@ -1,10 +1,11 @@
-use rig::{
-    completion::{message::Image, Prompt},
-    message::{ContentFormat, ImageMediaType},
-};
-
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
+use rig::message::DocumentSourceKind;
+use rig::prelude::*;
 use rig::providers::ollama;
+use rig::{
+    completion::{Prompt, message::Image},
+    message::ImageMediaType,
+};
 use tokio::fs;
 
 const IMAGE_FILE_PATH: &str = "rig-core/examples/images/camponotus_flavomarginatus_ant.jpg";
@@ -33,14 +34,15 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Compose `Image` for prompt
     let image = Image {
-        data: image_base64,
+        data: DocumentSourceKind::base64(&image_base64),
         media_type: Some(ImageMediaType::JPEG),
-        format: Some(ContentFormat::Base64),
         ..Default::default()
     };
 
     // Prompt the agent and print the response
     let response = agent.prompt(image).await?;
-    println!("{}", response);
+
+    println!("{response}");
+
     Ok(())
 }

@@ -1,12 +1,13 @@
-use std::env;
-
 use rig::{
+    Embed,
     embeddings::EmbeddingsBuilder,
     providers::cohere::{Client, EMBED_ENGLISH_V3},
-    vector_store::{in_memory_store::InMemoryVectorStore, VectorStoreIndex},
-    Embed,
+    vector_store::{
+        VectorStoreIndex, in_memory_store::InMemoryVectorStore, request::VectorSearchRequest,
+    },
 };
 use serde::{Deserialize, Serialize};
+use std::env;
 
 // Shape of data that needs to be RAG'ed.
 // The definition field will be used to generate embeddings.
@@ -23,10 +24,8 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create Cohere client
     let cohere_api_key = env::var("COHERE_API_KEY").expect("COHERE_API_KEY not set");
     let cohere_client = Client::new(&cohere_api_key);
-
     let document_model = cohere_client.embedding_model(EMBED_ENGLISH_V3, "search_document");
     let search_model = cohere_client.embedding_model(EMBED_ENGLISH_V3, "search_query");
-
     let embeddings = EmbeddingsBuilder::new(document_model.clone())
         .documents(vec![
             WordDefinition {
@@ -61,20 +60,22 @@ async fn main() -> Result<(), anyhow::Error> {
     let vector_store =
         InMemoryVectorStore::from_documents_with_id_f(embeddings, |doc| doc.id.clone());
 
+    let query = "Which instrument is found in the Nebulon Mountain Ranges?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()?;
+
     // Create vector store index
     let index = vector_store.index(search_model);
-
     let results = index
-        .top_n::<WordDefinition>(
-            "Which instrument is found in the Nebulon Mountain Ranges?",
-            1,
-        )
+        .top_n::<WordDefinition>(req)
         .await?
         .into_iter()
         .map(|(score, id, doc)| (score, id, doc.word))
         .collect::<Vec<_>>();
 
-    println!("Results: {:?}", results);
+    println!("Results: {results:?}");
 
     Ok(())
 }

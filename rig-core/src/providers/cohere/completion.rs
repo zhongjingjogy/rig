@@ -1,16 +1,21 @@
-use std::collections::HashMap;
-
 use crate::{
-    completion::{self, CompletionError},
-    json_utils, message, OneOrMany,
+    OneOrMany,
+    completion::{self, CompletionError, GetTokenUsage},
+    http_client::{self, HttpClientExt},
+    json_utils,
+    message::{self, Reasoning, ToolChoice},
+    telemetry::SpanCombinator,
 };
+use std::collections::HashMap;
 
 use super::client::Client;
 use crate::completion::CompletionRequest;
+use crate::providers::cohere::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use tracing::{Instrument, info_span};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub finish_reason: FinishReason,
@@ -36,7 +41,48 @@ impl CompletionResponse {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
+impl crate::telemetry::ProviderResponseExt for CompletionResponse {
+    type OutputMessage = Message;
+    type Usage = Usage;
+
+    fn get_response_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
+    fn get_response_model_name(&self) -> Option<String> {
+        None
+    }
+
+    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
+        vec![self.message.clone()]
+    }
+
+    fn get_text_response(&self) -> Option<String> {
+        let Message::Assistant { ref content, .. } = self.message else {
+            return None;
+        };
+
+        let res = content
+            .iter()
+            .filter_map(|x| {
+                if let AssistantContent::Text { text } = x {
+                    Some(text.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        if res.is_empty() { None } else { Some(res) }
+    }
+
+    fn get_usage(&self) -> Option<Self::Usage> {
+        self.usage.clone()
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FinishReason {
     MaxTokens,
@@ -46,7 +92,7 @@ pub enum FinishReason {
     ToolCall,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Usage {
     #[serde(default)]
     pub billed_units: Option<BilledUnits>,
@@ -54,7 +100,21 @@ pub struct Usage {
     pub tokens: Option<Tokens>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+impl GetTokenUsage for Usage {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let mut usage = crate::completion::Usage::new();
+
+        if let Some(ref billed_units) = self.billed_units {
+            usage.input_tokens = billed_units.input_tokens.unwrap_or_default() as u64;
+            usage.output_tokens = billed_units.output_tokens.unwrap_or_default() as u64;
+            usage.total_tokens = usage.input_tokens + usage.output_tokens;
+        }
+
+        Some(usage)
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct BilledUnits {
     #[serde(default)]
     pub output_tokens: Option<f64>,
@@ -66,7 +126,7 @@ pub struct BilledUnits {
     pub input_tokens: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Tokens {
     #[serde(default)]
     pub input_tokens: Option<f64>,
@@ -96,6 +156,13 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
         } else {
             OneOrMany::many(content.into_iter().map(|content| match content {
                 AssistantContent::Text { text } => completion::AssistantContent::text(text),
+                AssistantContent::Thinking { thinking } => {
+                    completion::AssistantContent::Reasoning(Reasoning {
+                        id: None,
+                        reasoning: vec![thinking],
+                        signature: None,
+                    })
+                }
             }))
             .map_err(|_| {
                 CompletionError::ResponseError(
@@ -104,8 +171,25 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             })?
         };
 
+        let usage = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.tokens.as_ref())
+            .map(|tokens| {
+                let input_tokens = tokens.input_tokens.unwrap_or(0.0);
+                let output_tokens = tokens.output_tokens.unwrap_or(0.0);
+
+                completion::Usage {
+                    input_tokens: input_tokens as u64,
+                    output_tokens: output_tokens as u64,
+                    total_tokens: (input_tokens + output_tokens) as u64,
+                }
+            })
+            .unwrap_or_default();
+
         Ok(completion::CompletionResponse {
             choice: OneOrMany::many(model_response).expect("There is atleast one content"),
+            usage,
             raw_response: response,
         })
     }
@@ -229,6 +313,7 @@ pub enum UserContent {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AssistantContent {
     Text { text: String },
+    Thinking { thinking: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -287,26 +372,25 @@ impl TryFrom<message::Message> for Vec<Message> {
                     message::UserContent::Text(message::Text { text }) => Ok(Message::User {
                         content: OneOrMany::one(UserContent::Text { text }),
                     }),
-                    message::UserContent::ToolResult(message::ToolResult { id, content }) => {
-                        Ok(Message::Tool {
-                            tool_call_id: id,
-                            content: content.try_map(|content| match content {
-                                message::ToolResultContent::Text(text) => {
-                                    Ok(ToolResultContent::Text { text: text.text })
-                                }
-                                _ => Err(message::MessageError::ConversionError(
-                                    "Only text tool result content is supported by Cohere"
-                                        .to_owned(),
-                                )),
-                            })?,
-                        })
-                    }
+                    message::UserContent::ToolResult(message::ToolResult {
+                        id, content, ..
+                    }) => Ok(Message::Tool {
+                        tool_call_id: id,
+                        content: content.try_map(|content| match content {
+                            message::ToolResultContent::Text(text) => {
+                                Ok(ToolResultContent::Text { text: text.text })
+                            }
+                            _ => Err(message::MessageError::ConversionError(
+                                "Only text tool result content is supported by Cohere".to_owned(),
+                            )),
+                        })?,
+                    }),
                     _ => Err(message::MessageError::ConversionError(
                         "Only text content is supported by Cohere".to_owned(),
                     )),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 let mut text_content = vec![];
                 let mut tool_calls = vec![];
                 content.into_iter().for_each(|content| match content {
@@ -315,7 +399,11 @@ impl TryFrom<message::Message> for Vec<Message> {
                     }
                     message::AssistantContent::ToolCall(message::ToolCall {
                         id,
-                        function: message::ToolFunction { name, arguments },
+                        function:
+                            message::ToolFunction {
+                                name, arguments, ..
+                            },
+                        ..
                     }) => {
                         tool_calls.push(ToolCall {
                             id: Some(id),
@@ -325,6 +413,10 @@ impl TryFrom<message::Message> for Vec<Message> {
                                 arguments: serde_json::to_value(arguments).unwrap_or_default(),
                             }),
                         });
+                    }
+                    message::AssistantContent::Reasoning(Reasoning { reasoning, .. }) => {
+                        let thinking = reasoning.join("\n");
+                        text_content.push(AssistantContent::Thinking { thinking });
                     }
                 });
 
@@ -349,12 +441,9 @@ impl TryFrom<Message> for message::Message {
                     UserContent::Text { text } => {
                         message::UserContent::Text(message::Text { text })
                     }
-                    UserContent::ImageUrl { image_url } => message::UserContent::image(
-                        image_url.url,
-                        Some(message::ContentFormat::String),
-                        None,
-                        None,
-                    ),
+                    UserContent::ImageUrl { image_url } => {
+                        message::UserContent::image_url(image_url.url, None, None)
+                    }
                 }),
             }),
             Message::Assistant {
@@ -366,6 +455,13 @@ impl TryFrom<Message> for message::Message {
                     .into_iter()
                     .map(|content| match content {
                         AssistantContent::Text { text } => message::AssistantContent::text(text),
+                        AssistantContent::Thinking { thinking } => {
+                            message::AssistantContent::Reasoning(Reasoning {
+                                id: None,
+                                reasoning: vec![thinking],
+                                signature: None,
+                            })
+                        }
                     })
                     .collect::<Vec<_>>();
 
@@ -385,7 +481,7 @@ impl TryFrom<Message> for message::Message {
                     )
                 })?;
 
-                Ok(message::Message::Assistant { content })
+                Ok(message::Message::Assistant { id: None, content })
             }
             Message::Tool {
                 content,
@@ -419,13 +515,16 @@ impl TryFrom<Message> for message::Message {
 }
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> CompletionModel<T>
+where
+    T: HttpClientExt,
+{
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -467,6 +566,9 @@ impl CompletionModel {
             "documents": completion_request.documents,
             "temperature": completion_request.temperature,
             "tools": completion_request.tools.into_iter().map(Tool::from).collect::<Vec<_>>(),
+            "tool_choice": if let Some(tool_choice) = completion_request.tool_choice && !matches!(tool_choice, ToolChoice::Auto) { tool_choice } else {
+                return Err(CompletionError::RequestError("\"auto\" is not an allowed tool_choice value in the Cohere API".into()))
+            },
         });
 
         if let Some(ref params) = completion_request.additional_params {
@@ -477,8 +579,9 @@ impl CompletionModel {
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl completion::CompletionModel for CompletionModel<reqwest::Client> {
     type Response = CompletionResponse;
+    type StreamingResponse = StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -486,24 +589,76 @@ impl completion::CompletionModel for CompletionModel {
         completion_request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
         let request = self.create_completion_request(completion_request)?;
+
+        let llm_span = if tracing::Span::current().is_disabled() {
+            info_span!(
+            target: "rig::completions",
+            "chat",
+            gen_ai.operation.name = "chat",
+            gen_ai.provider.name = "cohere",
+            gen_ai.request.model = self.model,
+            gen_ai.response.id = tracing::field::Empty,
+            gen_ai.response.model = self.model,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.input.messages = serde_json::to_string(request.get("messages").expect("Converting request messages to JSON should not fail!")).unwrap(),
+            gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
         tracing::debug!(
             "Cohere request: {}",
             serde_json::to_string_pretty(&request)?
         );
 
-        let response = self.client.post("/v2/chat").json(&request).send().await?;
+        async {
+            let response = self
+                .client
+                .client()
+                .post("/v2/chat")
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| http_client::Error::Instance(e.into()))?;
 
-        if response.status().is_success() {
-            let text_response = response.text().await?;
-            tracing::debug!("Cohere response text: {}", text_response);
+            if response.status().is_success() {
+                let text_response = response.text().await.map_err(|e| {
+                    CompletionError::HttpError(http_client::Error::Instance(e.into()))
+                })?;
+                tracing::debug!("Cohere completion request: {}", text_response);
 
-            let json_response: CompletionResponse = serde_json::from_str(&text_response)?;
-            let completion: completion::CompletionResponse<CompletionResponse> =
-                json_response.try_into()?;
-            Ok(completion)
-        } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+                let json_response: CompletionResponse = serde_json::from_str(&text_response)?;
+                let span = tracing::Span::current();
+                span.record_token_usage(&json_response.usage);
+                span.record_model_output(&json_response.message);
+                span.record_response_metadata(&json_response);
+                tracing::debug!("Cohere completion response: {}", text_response);
+                let completion: completion::CompletionResponse<CompletionResponse> =
+                    json_response.try_into()?;
+                Ok(completion)
+            } else {
+                Err(CompletionError::ProviderError(
+                    response.text().await.map_err(|e| {
+                        CompletionError::HttpError(http_client::Error::Instance(e.into()))
+                    })?,
+                ))
+            }
         }
+        .instrument(llm_span)
+        .await
+    }
+
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
+        CompletionModel::stream(self, request).await
     }
 }
 #[cfg(test)]

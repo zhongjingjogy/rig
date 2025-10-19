@@ -5,9 +5,9 @@ use aws_sdk_bedrockruntime::types::{
     InferenceConfiguration, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
     ToolSpecification,
 };
-use rig::completion::{CompletionError, Message};
-use rig::message::{ContentFormat, DocumentMediaType, UserContent};
 use rig::OneOrMany;
+use rig::completion::{CompletionError, Message};
+use rig::message::{DocumentMediaType, UserContent};
 
 pub struct AwsCompletionRequest(pub rig::completion::CompletionRequest);
 
@@ -85,7 +85,6 @@ impl AwsCompletionRequest {
 
             let content = OneOrMany::one(UserContent::document(
                 messages,
-                Some(ContentFormat::String),
                 Some(DocumentMediaType::TXT),
             ));
 

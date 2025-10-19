@@ -5,21 +5,38 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use std::{collections::HashMap, ops::Deref};
 use syn::{
+    DeriveInput, Expr, ExprLit, Ident, Lit, Meta, PathArguments, ReturnType, Token, Type,
     parse::{Parse, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
-    DeriveInput, Expr, ExprLit, Lit, Meta, PathArguments, ReturnType, Token, Type,
 };
 
 mod basic;
+mod client;
 mod custom;
 mod embed;
 
 pub(crate) const EMBED: &str = "embed";
 
-/// References:
-/// <https://doc.rust-lang.org/book/ch19-06-macros.html#how-to-write-a-custom-derive-macro>
-/// <https://doc.rust-lang.org/reference/procedural-macros.html>
+#[proc_macro_derive(ProviderClient, attributes(client))]
+pub fn derive_provider_client(input: TokenStream) -> TokenStream {
+    client::provider_client(input)
+}
+
+//References:
+//<https://doc.rust-lang.org/book/ch19-06-macros.html#how-to-write-a-custom-derive-macro>
+//<https://doc.rust-lang.org/reference/procedural-macros.html>
+/// A macro that allows you to implement the `rig::embedding::Embed` trait by deriving it.
+/// Usage can be found below:
+///
+/// ```rust
+/// #[derive(Embed)]
+/// struct Foo {
+///     id: String,
+///     #[embed] // this helper shows which field to embed
+///     description: String
+///}
+/// ```
 #[proc_macro_derive(Embed, attributes(embed))]
 pub fn derive_embedding_trait(item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as DeriveInput);
@@ -32,18 +49,21 @@ pub fn derive_embedding_trait(item: TokenStream) -> TokenStream {
 struct MacroArgs {
     description: Option<String>,
     param_descriptions: HashMap<String, String>,
+    required: Vec<String>,
 }
 
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut description = None;
         let mut param_descriptions = HashMap::new();
+        let mut required = Vec::new();
 
         // If the input is empty, return default values
         if input.is_empty() {
             return Ok(MacroArgs {
                 description,
                 param_descriptions,
+                required,
             });
         }
 
@@ -57,10 +77,9 @@ impl Parse for MacroArgs {
                         lit: Lit::Str(lit_str),
                         ..
                     }) = nv.value
+                        && ident.as_str() == "description"
                     {
-                        if ident.as_str() == "description" {
-                            description = Some(lit_str.value());
-                        }
+                        description = Some(lit_str.value());
                     }
                 }
                 Meta::List(list) if list.path.is_ident("params") => {
@@ -68,17 +87,24 @@ impl Parse for MacroArgs {
                         list.parse_args_with(Punctuated::parse_terminated)?;
 
                     for meta in nested {
-                        if let Meta::NameValue(nv) = meta {
-                            if let Expr::Lit(ExprLit {
+                        if let Meta::NameValue(nv) = meta
+                            && let Expr::Lit(ExprLit {
                                 lit: Lit::Str(lit_str),
                                 ..
                             }) = nv.value
-                            {
-                                let param_name = nv.path.get_ident().unwrap().to_string();
-                                param_descriptions.insert(param_name, lit_str.value());
-                            }
+                        {
+                            let param_name = nv.path.get_ident().unwrap().to_string();
+                            param_descriptions.insert(param_name, lit_str.value());
                         }
                     }
+                }
+                Meta::List(list) if list.path.is_ident("required") => {
+                    let required_variables: Punctuated<Ident, Token![,]> =
+                        list.parse_args_with(Punctuated::parse_terminated)?;
+
+                    required_variables.into_iter().for_each(|x| {
+                        required.push(x.to_string());
+                    });
                 }
                 _ => {}
             }
@@ -87,6 +113,7 @@ impl Parse for MacroArgs {
         Ok(MacroArgs {
             description,
             param_descriptions,
+            required,
         })
     }
 }
@@ -99,14 +126,14 @@ fn get_json_type(ty: &Type) -> proc_macro2::TokenStream {
 
             // Handle Vec types
             if type_name == "Vec" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let syn::GenericArgument::Type(inner_type) = &args.args[0] {
-                        let inner_json_type = get_json_type(inner_type);
-                        return quote! {
-                            "type": "array",
-                            "items": { #inner_json_type }
-                        };
-                    }
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+                    && let syn::GenericArgument::Type(inner_type) = &args.args[0]
+                {
+                    let inner_json_type = get_json_type(inner_type);
+                    return quote! {
+                        "type": "array",
+                        "items": { #inner_json_type }
+                    };
                 }
                 return quote! { "type": "array" };
             }
@@ -209,7 +236,9 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                                 // Convert the error type to a string for comparison
                                 let error_str = quote!(#error).to_string().replace(" ", "");
                                 if !error_str.contains("rig::tool::ToolError") {
-                                    panic!("Expected rig::tool::ToolError as second type parameter but found {}", error_str);
+                                    panic!(
+                                        "Expected rig::tool::ToolError as second type parameter but found {error_str}"
+                                    );
                                 }
 
                                 quote!(#output)
@@ -247,24 +276,26 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
     let mut param_descriptions = Vec::new();
     let mut json_types = Vec::new();
 
-    for arg in input_fn.sig.inputs.iter() {
-        if let syn::FnArg::Typed(pat_type) = arg {
-            if let syn::Pat::Ident(param_ident) = &*pat_type.pat {
-                let param_name = &param_ident.ident;
-                let param_name_str = param_name.to_string();
-                let ty = &pat_type.ty;
-                let default_parameter_description = format!("Parameter {}", param_name_str);
-                let description = args
-                    .param_descriptions
-                    .get(&param_name_str)
-                    .map(|s| s.to_owned())
-                    .unwrap_or(default_parameter_description);
+    let required_args = args.required;
 
-                param_names.push(param_name);
-                param_types.push(ty);
-                param_descriptions.push(description);
-                json_types.push(get_json_type(ty));
-            }
+    for arg in input_fn.sig.inputs.iter() {
+        if let syn::FnArg::Typed(pat_type) = arg
+            && let syn::Pat::Ident(param_ident) = &*pat_type.pat
+        {
+            let param_name = &param_ident.ident;
+            let param_name_str = param_name.to_string();
+            let ty = &pat_type.ty;
+            let default_parameter_description = format!("Parameter {param_name_str}");
+            let description = args
+                .param_descriptions
+                .get(&param_name_str)
+                .map(|s| s.to_owned())
+                .unwrap_or(default_parameter_description);
+
+            param_names.push(param_name);
+            param_types.push(ty);
+            param_descriptions.push(description);
+            json_types.push(get_json_type(ty));
         }
     }
 
@@ -318,7 +349,8 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                                 "description": #param_descriptions
                             }
                         ),*
-                    }
+                    },
+                    "required": [#(#required_args),*]
                 });
 
                 rig::completion::ToolDefinition {

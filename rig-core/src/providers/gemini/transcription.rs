@@ -1,18 +1,19 @@
 use std::path::Path;
 
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use mime_guess;
 use serde_json::{Map, Value};
 
 use crate::{
+    http_client::HttpClientExt,
     providers::gemini::completion::gemini_api_types::{
-        Blob, Content, GenerateContentRequest, GenerationConfig, Part, Role,
+        Blob, Content, GenerateContentRequest, GenerationConfig, Part, PartKind, Role,
     },
     transcription::{self, TranscriptionError},
-    OneOrMany,
+    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
-use super::{completion::gemini_api_types::GenerateContentResponse, Client};
+use super::{Client, completion::gemini_api_types::GenerateContentResponse};
 
 pub use super::completion::{
     GEMINI_1_5_FLASH, GEMINI_1_5_PRO, GEMINI_1_5_PRO_8B, GEMINI_2_0_FLASH,
@@ -22,14 +23,14 @@ const TRANSCRIPTION_PREAMBLE: &str =
     "Translate the provided audio exactly. Do not add additional information.";
 
 #[derive(Clone)]
-pub struct TranscriptionModel {
-    client: Client,
+pub struct TranscriptionModel<T = reqwest::Client> {
+    client: Client<T>,
     /// Name of the model (e.g.: gemini-1.5-flash)
     pub model: String,
 }
 
-impl TranscriptionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+impl<T> TranscriptionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -37,7 +38,10 @@ impl TranscriptionModel {
     }
 }
 
-impl transcription::TranscriptionModel for TranscriptionModel {
+impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
+where
+    T: HttpClientExt + WasmCompatSend + WasmCompatSync + Clone,
+{
     type Response = GenerateContentResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
@@ -60,7 +64,7 @@ impl transcription::TranscriptionModel for TranscriptionModel {
         }
 
         let system_instruction = Some(Content {
-            parts: OneOrMany::one(TRANSCRIPTION_PREAMBLE.into()),
+            parts: vec![TRANSCRIPTION_PREAMBLE.into()],
             role: Some(Role::Model),
         });
 
@@ -73,10 +77,15 @@ impl transcription::TranscriptionModel for TranscriptionModel {
 
         let request = GenerateContentRequest {
             contents: vec![Content {
-                parts: OneOrMany::one(Part::InlineData(Blob {
-                    mime_type,
-                    data: BASE64_STANDARD.encode(request.data),
-                })),
+                parts: vec![Part {
+                    thought: Some(false),
+                    thought_signature: None,
+                    part: PartKind::InlineData(Blob {
+                        mime_type,
+                        data: BASE64_STANDARD.encode(request.data),
+                    }),
+                    additional_params: None,
+                }],
                 role: Some(Role::User),
             }],
             generation_config: Some(generation_config),
@@ -84,6 +93,7 @@ impl transcription::TranscriptionModel for TranscriptionModel {
             tools: None,
             tool_config: None,
             system_instruction,
+            additional_params: None,
         };
 
         tracing::debug!(
@@ -91,16 +101,21 @@ impl transcription::TranscriptionModel for TranscriptionModel {
             serde_json::to_string_pretty(&request)?
         );
 
-        let response = self
+        let body = serde_json::to_vec(&request)?;
+        let req = self
             .client
             .post(&format!("/v1beta/models/{}:generateContent", self.model))
-            .json(&request)
-            .send()
-            .await?;
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| TranscriptionError::HttpError(e.into()))?;
+
+        let response = self.client.send::<_, Vec<u8>>(req).await?;
 
         if response.status().is_success() {
-            let response = response.json::<GenerateContentResponse>().await?;
-            match response.usage_metadata {
+            let body: GenerateContentResponse =
+                serde_json::from_slice(&response.into_body().await?)?;
+
+            match body.usage_metadata {
                 Some(ref usage) => tracing::info!(target: "rig",
                 "Gemini completion token usage: {}",
                 usage
@@ -112,10 +127,11 @@ impl transcription::TranscriptionModel for TranscriptionModel {
 
             tracing::debug!("Received response");
 
-            Ok(transcription::TranscriptionResponse::try_from(response))
+            Ok(transcription::TranscriptionResponse::try_from(body)?)
         } else {
-            Err(TranscriptionError::ProviderError(response.text().await?))
-        }?
+            let text = String::from_utf8_lossy(&response.into_body().await?).into();
+            Err(TranscriptionError::ProviderError(text))
+        }
     }
 }
 
@@ -132,14 +148,25 @@ impl TryFrom<GenerateContentResponse>
         let part = candidate.content.parts.first();
 
         let text = match part {
-            Part::Text(text) => text,
+            Some(Part {
+                part: PartKind::Text(text),
+                ..
+            }) => text,
+            None => {
+                return Err(TranscriptionError::ResponseError(
+                    "Response content contains no text".to_string(),
+                ));
+            }
             _ => {
                 return Err(TranscriptionError::ResponseError(
                     "Response content was not text".to_string(),
-                ))
+                ));
             }
         };
 
-        Ok(transcription::TranscriptionResponse { text, response })
+        Ok(transcription::TranscriptionResponse {
+            text: text.to_string(),
+            response,
+        })
     }
 }

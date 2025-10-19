@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatchIterator;
-use fixture::{as_record_batch, schema, words, Word};
+use fixture::{Word, as_record_batch, schema, words};
 use lancedb::index::vector::IvfPqIndexBuilder;
+use rig::client::{EmbeddingsClient, ProviderClient};
+use rig::vector_store::request::VectorSearchRequest;
 use rig::{
     embeddings::{EmbeddingModel, EmbeddingsBuilder},
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
@@ -31,7 +33,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .documents(
             (0..256)
                 .map(|i| Word {
-                    id: format!("doc{}", i),
+                    id: format!("doc{i}"),
                     definition: "Definition of *flumbuzzle (noun)*: A sudden, inexplicable urge to rearrange or reorganize small objects, such as desk items or books, for no apparent reason.".to_string()
                 })
         )?
@@ -72,12 +74,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let search_params = SearchParams::default();
     let vector_store_index = LanceDbVectorIndex::new(table, model, "id", search_params).await?;
 
-    // Query the index
-    let results = vector_store_index
-        .top_n::<Word>("My boss says I zindle too much, what does that mean?", 1)
-        .await?;
+    let query = "My boss says I zindle too much, what does that mean?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()?;
 
-    println!("Results: {:?}", results);
+    // Query the index
+    let results = vector_store_index.top_n::<Word>(req).await?;
+
+    println!("Results: {results:?}");
 
     Ok(())
 }

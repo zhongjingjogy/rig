@@ -1,13 +1,15 @@
+use rig::vector_store::request::VectorSearchRequest;
 use serde_json::json;
 
+use rig::client::EmbeddingsClient;
 use rig::vector_store::VectorStoreIndex;
 use rig::{
+    Embed, OneOrMany,
     embeddings::{Embedding, EmbeddingsBuilder},
     providers::openai,
-    Embed, OneOrMany,
 };
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStore, SqliteVectorStoreTable};
-use rusqlite::ffi::sqlite3_auto_extension;
+use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use sqlite_vec::sqlite3_vec_init;
 use tokio_rusqlite::Connection;
 
@@ -42,12 +44,17 @@ impl SqliteVectorStoreTable for Word {
     }
 }
 
+type SqliteExtensionFn =
+    unsafe extern "C" fn(*mut sqlite3, *mut *mut i8, *const sqlite3_api_routines) -> i32;
+
 #[tokio::test]
 async fn vector_search_test() {
     // Initialize the `sqlite-vec`extension
     // See: https://alexgarcia.xyz/sqlite-vec/rust.html
     unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+        sqlite3_auto_extension(Some(std::mem::transmute::<*const (), SqliteExtensionFn>(
+            sqlite3_vec_init as *const (),
+        )));
     }
 
     // Initialize SQLite connection
@@ -69,6 +76,7 @@ async fn vector_search_test() {
                     "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -108,6 +116,7 @@ async fn vector_search_test() {
                     "What is a glarb?",
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -130,7 +139,9 @@ async fn vector_search_test() {
     });
 
     // Initialize OpenAI client
-    let openai_client = openai::Client::from_url("TEST", &server.base_url());
+    let openai_client = openai::Client::builder("TEST")
+        .base_url(&server.base_url())
+        .build();
 
     // Select the embedding model and generate our embeddings
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
@@ -150,12 +161,16 @@ async fn vector_search_test() {
 
     // Create a vector index on our vector store
     let index = vector_store.index(model);
+    let query = "What is a glarb?";
+    let samples = 1;
+    let req = VectorSearchRequest::builder()
+        .samples(samples)
+        .query(query)
+        .build()
+        .expect("VectorSearchRequest should not fail to build here");
 
     // Query the index
-    let results = index
-        .top_n::<serde_json::Value>("What is a glarb?", 1)
-        .await
-        .expect("");
+    let results = index.top_n::<serde_json::Value>(req).await.expect("");
 
     let (_, _, value) = &results.first().expect("");
 

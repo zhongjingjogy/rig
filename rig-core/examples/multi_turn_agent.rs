@@ -1,3 +1,4 @@
+use rig::prelude::*;
 use rig::{
     completion::{Prompt, ToolDefinition},
     providers::anthropic,
@@ -21,10 +22,10 @@ async fn main() -> anyhow::Result<()> {
         .agent(anthropic::CLAUDE_3_5_SONNET)
         .preamble(
             "You are an assistant here to help the user select which tool is most appropriate to perform arithmetic operations.
-            Follow these instructions closely. 
+            Follow these instructions closely.
             1. Consider the user's request carefully and identify the core elements of the request.
-            2. Select which tool among those made available to you is appropriate given the context. 
-            3. This is very important: never perform the operation yourself. 
+            2. Select which tool among those made available to you is appropriate given the context.
+            3. This is very important: never perform the operation yourself.
             "
         )
         .tool(Add)
@@ -39,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .multi_turn(20)
         .await?;
 
-    println!("\n\nOpenAI Calculator Agent: {}", result);
+    println!("\n\nOpenAI Calculator Agent: {result}");
 
     // Prompt the agent again and print the response
     let result = agent
@@ -47,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .multi_turn(20)
         .await?;
 
-    println!("\n\nOpenAI Calculator Agent: {}", result);
+    println!("\n\nOpenAI Calculator Agent: {result}");
 
     Ok(())
 }
@@ -64,9 +65,9 @@ struct MathError;
 
 #[derive(Deserialize, Serialize)]
 struct Add;
+
 impl Tool for Add {
     const NAME: &'static str = "add";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -100,9 +101,9 @@ impl Tool for Add {
 
 #[derive(Deserialize, Serialize)]
 struct Subtract;
+
 impl Tool for Subtract {
     const NAME: &'static str = "subtract";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -134,10 +135,11 @@ impl Tool for Subtract {
     }
 }
 
+#[derive(Deserialize, Serialize)]
 struct Multiply;
+
 impl Tool for Multiply {
     const NAME: &'static str = "multiply";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -169,10 +171,11 @@ impl Tool for Multiply {
     }
 }
 
+#[derive(Deserialize, Serialize)]
 struct Divide;
+
 impl Tool for Divide {
     const NAME: &'static str = "divide";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;

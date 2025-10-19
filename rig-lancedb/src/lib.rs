@@ -1,10 +1,10 @@
 use lancedb::{
-    query::{QueryBase, VectorQuery},
     DistanceType,
+    query::{QueryBase, VectorQuery},
 };
 use rig::{
     embeddings::embedding::EmbeddingModel,
-    vector_store::{VectorStoreError, VectorStoreIndex},
+    vector_store::{VectorStoreError, VectorStoreIndex, request::VectorSearchRequest},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -43,7 +43,10 @@ pub struct LanceDbVectorIndex<M: EmbeddingModel> {
     search_params: SearchParams,
 }
 
-impl<M: EmbeddingModel> LanceDbVectorIndex<M> {
+impl<M> LanceDbVectorIndex<M>
+where
+    M: EmbeddingModel,
+{
     /// Create an instance of `LanceDbVectorIndex` with an existing table and model.
     /// Define the id field name of the table.
     /// Define search parameters that will be used to perform vector searches on the table.
@@ -176,7 +179,10 @@ impl SearchParams {
     }
 }
 
-impl<M: EmbeddingModel + Sync + Send> VectorStoreIndex for LanceDbVectorIndex<M> {
+impl<M> VectorStoreIndex for LanceDbVectorIndex<M>
+where
+    M: EmbeddingModel + Sync + Send,
+{
     /// Implement the `top_n` method of the `VectorStoreIndex` trait for `LanceDbVectorIndex`.
     /// # Example
     /// ```
@@ -196,16 +202,16 @@ impl<M: EmbeddingModel + Sync + Send> VectorStoreIndex for LanceDbVectorIndex<M>
     /// ```
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let prompt_embedding = self.model.embed_text(query).await?;
+        let prompt_embedding = self.model.embed_text(req.query()).await?;
 
         let query = self
             .table
             .vector_search(prompt_embedding.vec.clone())
             .map_err(lancedb_to_rig_error)?
-            .limit(n)
+            .limit(req.samples() as usize)
+            .distance_range(None, req.threshold().map(|x| x as f32))
             .select(lancedb::query::Select::Columns(
                 self.table
                     .schema()
@@ -254,10 +260,9 @@ impl<M: EmbeddingModel + Sync + Send> VectorStoreIndex for LanceDbVectorIndex<M>
     /// ```
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        let prompt_embedding = self.model.embed_text(query).await?;
+        let prompt_embedding = self.model.embed_text(req.query()).await?;
 
         let query = self
             .table
@@ -265,7 +270,8 @@ impl<M: EmbeddingModel + Sync + Send> VectorStoreIndex for LanceDbVectorIndex<M>
             .select(lancedb::query::Select::Columns(vec![self.id_field.clone()]))
             .nearest_to(prompt_embedding.vec.clone())
             .map_err(lancedb_to_rig_error)?
-            .limit(n);
+            .distance_range(None, req.threshold().map(|x| x as f32))
+            .limit(req.samples() as usize);
 
         self.build_query(query)
             .execute_query()

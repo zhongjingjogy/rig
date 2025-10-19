@@ -1,6 +1,7 @@
-use rig::embeddings::{Embedding, EmbeddingModel};
-use rig::vector_store::{VectorStoreError, VectorStoreIndex};
 use rig::OneOrMany;
+use rig::embeddings::{Embedding, EmbeddingModel};
+use rig::vector_store::request::VectorSearchRequest;
+use rig::vector_store::{VectorStoreError, VectorStoreIndex};
 use serde::Deserialize;
 use std::marker::PhantomData;
 use tokio_rusqlite::Connection;
@@ -85,19 +86,27 @@ pub trait SqliteVectorStoreTable: Send + Sync + Clone {
 }
 
 #[derive(Clone)]
-pub struct SqliteVectorStore<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> {
+pub struct SqliteVectorStore<E, T>
+where
+    E: EmbeddingModel + 'static,
+    T: SqliteVectorStoreTable + 'static,
+{
     conn: Connection,
     _phantom: PhantomData<(E, T)>,
 }
 
-impl<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> SqliteVectorStore<E, T> {
+impl<E, T> SqliteVectorStore<E, T>
+where
+    E: EmbeddingModel + 'static,
+    T: SqliteVectorStoreTable + 'static,
+{
     pub async fn new(conn: Connection, embedding_model: &E) -> Result<Self, VectorStoreError> {
         let dims = embedding_model.ndims();
         let table_name = T::name();
         let schema = T::schema();
 
         // Build the table schema
-        let mut create_table = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
+        let mut create_table = format!("CREATE TABLE IF NOT EXISTS {table_name} (");
 
         // Add columns
         let mut first = true;
@@ -140,8 +149,7 @@ impl<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> SqliteVec
 
             // Create embeddings table
             conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS {}_embeddings USING vec0(embedding float[{}])",
-                table_name, dims
+                "CREATE VIRTUAL TABLE IF NOT EXISTS {table_name}_embeddings USING vec0(embedding float[{dims}])"
             ))?;
 
             conn.execute_batch("COMMIT")?;
@@ -176,7 +184,7 @@ impl<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> SqliteVec
             let columns = values.iter().map(|(col, _)| *col).collect::<Vec<_>>();
 
             let placeholders = (1..=values.len())
-                .map(|i| format!("?{}", i))
+                .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>();
 
             let insert_sql = format!(
@@ -192,10 +200,8 @@ impl<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> SqliteVec
             )?;
             last_id = txn.last_insert_rowid();
 
-            let embeddings_sql = format!(
-                "INSERT INTO {}_embeddings (rowid, embedding) VALUES (?1, ?2)",
-                table_name
-            );
+            let embeddings_sql =
+                format!("INSERT INTO {table_name}_embeddings (rowid, embedding) VALUES (?1, ?2)");
 
             let mut stmt = txn.prepare(&embeddings_sql)?;
             for (i, embedding) in embeddings.iter().enumerate() {
@@ -315,12 +321,20 @@ impl<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> SqliteVec
 ///     .top_n::<Document>("Example query", 2)
 ///     .await?;
 /// ```
-pub struct SqliteVectorIndex<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable + 'static> {
+pub struct SqliteVectorIndex<E, T>
+where
+    E: EmbeddingModel + 'static,
+    T: SqliteVectorStoreTable + 'static,
+{
     store: SqliteVectorStore<E, T>,
     embedding_model: E,
 }
 
-impl<E: EmbeddingModel + 'static, T: SqliteVectorStoreTable> SqliteVectorIndex<E, T> {
+impl<E, T> SqliteVectorIndex<E, T>
+where
+    E: EmbeddingModel + 'static,
+    T: SqliteVectorStoreTable,
+{
     pub fn new(embedding_model: E, store: SqliteVectorStore<E, T>) -> Self {
         Self {
             store,
@@ -334,11 +348,10 @@ impl<E: EmbeddingModel + std::marker::Sync, T: SqliteVectorStoreTable> VectorSto
 {
     async fn top_n<D: for<'a> Deserialize<'a>>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, D)>, VectorStoreError> {
-        debug!("Finding top {} matches for query", n);
-        let embedding = self.embedding_model.embed_text(query).await?;
+        tracing::debug!("Finding top {} matches for query", req.samples() as usize);
+        let embedding = self.embedding_model.embed_text(req.query()).await?;
         let query_vec: Vec<f32> = serialize_embedding(&embedding);
         let table_name = T::name();
 
@@ -353,27 +366,33 @@ impl<E: EmbeddingModel + std::marker::Sync, T: SqliteVectorStoreTable> VectorSto
                 // Build SELECT statement with all columns
                 let select_cols = column_names.join(", ");
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT d.{}, e.distance 
-                    FROM {}_embeddings e
-                    JOIN {} d ON e.rowid = d.rowid
-                    WHERE e.embedding MATCH ?1 AND k = ?2
-                    ORDER BY e.distance",
-                    select_cols, table_name, table_name
+                    "SELECT d.{select_cols}, e.distance
+                    FROM {table_name}_embeddings e
+                    JOIN {table_name} d ON e.rowid = d.rowid
+                    WHERE e.embedding MATCH ?1 AND k = ?2 AND e.distance >= ?3
+                    ORDER BY e.distance"
                 ))?;
 
                 let rows = stmt
-                    .query_map(rusqlite::params![query_vec.as_bytes().to_vec(), n], |row| {
-                        // Create a map of column names to values
-                        let mut map = serde_json::Map::new();
-                        for (i, col_name) in column_names.iter().enumerate() {
-                            let value: String = row.get(i)?;
-                            map.insert(col_name.to_string(), serde_json::Value::String(value));
-                        }
-                        let distance: f64 = row.get(column_names.len())?;
-                        let id: String = row.get(0)?; // Assuming id is always first column
+                    .query_map(
+                        rusqlite::params![
+                            query_vec.as_bytes().to_vec(),
+                            req.samples() as usize,
+                            req.threshold().unwrap_or(0.)
+                        ],
+                        |row| {
+                            // Create a map of column names to values
+                            let mut map = serde_json::Map::new();
+                            for (i, col_name) in column_names.iter().enumerate() {
+                                let value: String = row.get(i)?;
+                                map.insert(col_name.to_string(), serde_json::Value::String(value));
+                            }
+                            let distance: f64 = row.get(column_names.len())?;
+                            let id: String = row.get(0)?; // Assuming id is always first column
 
-                        Ok((id, serde_json::Value::Object(map), distance))
-                    })?
+                            Ok((id, serde_json::Value::Object(map), distance))
+                        },
+                    )?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
@@ -400,11 +419,13 @@ impl<E: EmbeddingModel + std::marker::Sync, T: SqliteVectorStoreTable> VectorSto
 
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
-        debug!("Finding top {} document IDs for query", n);
-        let embedding = self.embedding_model.embed_text(query).await?;
+        tracing::debug!(
+            "Finding top {} document IDs for query",
+            req.samples() as usize
+        );
+        let embedding = self.embedding_model.embed_text(req.query()).await?;
         let query_vec = serialize_embedding(&embedding);
         let table_name = T::name();
 
@@ -413,12 +434,11 @@ impl<E: EmbeddingModel + std::marker::Sync, T: SqliteVectorStoreTable> VectorSto
             .conn
             .call(move |conn| {
                 let mut stmt = conn.prepare(&format!(
-                    "SELECT d.id, e.distance 
-                     FROM {0}_embeddings e
-                     JOIN {0} d ON e.rowid = d.rowid
-                     WHERE e.embedding MATCH ?1 AND k = ?2
-                     ORDER BY e.distance",
-                    table_name
+                    "SELECT d.id, e.distance
+                     FROM {table_name}_embeddings e
+                     JOIN {table_name} d ON e.rowid = d.rowid
+                     WHERE e.embedding MATCH ?1 AND k = ?2 AND e.distance >= ?3
+                     ORDER BY e.distance"
                 ))?;
 
                 let results = stmt
@@ -428,7 +448,8 @@ impl<E: EmbeddingModel + std::marker::Sync, T: SqliteVectorStoreTable> VectorSto
                                 .iter()
                                 .flat_map(|x| x.to_le_bytes())
                                 .collect::<Vec<u8>>(),
-                            n
+                            req.samples() as usize,
+                            req.threshold().unwrap_or(0.)
                         ],
                         |row| Ok((row.get::<_, f64>(1)?, row.get::<_, String>(0)?)),
                     )?

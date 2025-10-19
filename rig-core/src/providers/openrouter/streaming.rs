@@ -1,19 +1,19 @@
+use reqwest_eventsource::{Event, RequestBuilderExt};
 use std::collections::HashMap;
+use tracing::info_span;
 
 use crate::{
-    json_utils,
+    completion::GetTokenUsage,
+    http_client, json_utils,
     message::{ToolCall, ToolFunction},
     streaming::{self},
 };
 use async_stream::stream;
 use futures::StreamExt;
 use reqwest::RequestBuilder;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::{
-    completion::{CompletionError, CompletionRequest},
-    streaming::StreamingCompletionModel,
-};
+use crate::completion::{CompletionError, CompletionRequest};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,6 +27,18 @@ pub struct StreamingCompletionResponse {
     pub system_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ResponseUsage>,
+}
+
+impl GetTokenUsage for FinalCompletionResponse {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let mut usage = crate::completion::Usage::new();
+
+        usage.input_tokens = self.usage.prompt_tokens as u64;
+        usage.output_tokens = self.usage.completion_tokens as u64;
+        usage.total_tokens = self.usage.total_tokens as u64;
+
+        Some(usage)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -96,44 +108,72 @@ pub struct DeltaResponse {
     pub native_finish_reason: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct FinalCompletionResponse {
     pub usage: ResponseUsage,
 }
 
-impl StreamingCompletionModel for super::CompletionModel {
-    type StreamingResponse = FinalCompletionResponse;
-
-    async fn stream(
+impl super::CompletionModel<reqwest::Client> {
+    pub(crate) async fn stream(
         &self,
         completion_request: CompletionRequest,
-    ) -> Result<streaming::StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
+    ) -> Result<streaming::StreamingCompletionResponse<FinalCompletionResponse>, CompletionError>
     {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
 
         let request = json_utils::merge(request, json!({"stream": true}));
 
-        let builder = self.client.post("/chat/completions").json(&request);
+        let builder = self
+            .client
+            .reqwest_post("/chat/completions")
+            .header("Content-Type", "application/json")
+            .json(&request);
 
-        send_streaming_request(builder).await
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat_streaming",
+                gen_ai.operation.name = "chat_streaming",
+                gen_ai.provider.name = "openrouter",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        tracing::Instrument::instrument(send_streaming_request(builder), span).await
     }
 }
 
 pub async fn send_streaming_request(
     request_builder: RequestBuilder,
 ) -> Result<streaming::StreamingCompletionResponse<FinalCompletionResponse>, CompletionError> {
-    let response = request_builder.send().await?;
+    let response = request_builder
+        .send()
+        .await
+        .map_err(|e| CompletionError::HttpError(http_client::Error::Instance(e.into())))?;
 
     if !response.status().is_success() {
         return Err(CompletionError::ProviderError(format!(
             "{}: {}",
             response.status(),
-            response.text().await?
+            response
+                .text()
+                .await
+                .map_err(|e| CompletionError::HttpError(http_client::Error::Instance(e.into())))?
         )));
     }
 
     // Handle OpenAI Compatible SSE chunks
-    let stream = Box::pin(stream! {
+    let stream = stream! {
         let mut stream = response.bytes_stream();
         let mut tool_calls = HashMap::new();
         let mut partial_line = String::new();
@@ -143,7 +183,7 @@ pub async fn send_streaming_request(
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    yield Err(CompletionError::from(e));
+                    yield Err(CompletionError::from(http_client::Error::Instance(e.into())));
                     break;
                 }
             };
@@ -212,6 +252,7 @@ pub async fn send_streaming_request(
                             // Get or create tool call entry
                             let existing_tool_call = tool_calls.entry(index).or_insert_with(|| ToolCall {
                                 id: String::new(),
+                                call_id: None,
                                 function: ToolFunction {
                                     name: String::new(),
                                     arguments: serde_json::Value::Null,
@@ -219,16 +260,14 @@ pub async fn send_streaming_request(
                             });
 
                             // Update fields if present
-                            if let Some(id) = &tool_call.id {
-                                if !id.is_empty() {
+                            if let Some(id) = &tool_call.id && !id.is_empty() {
                                     existing_tool_call.id = id.clone();
-                                }
                             }
-                            if let Some(name) = &tool_call.function.name {
-                                if !name.is_empty() {
+
+                            if let Some(name) = &tool_call.function.name && !name.is_empty() {
                                     existing_tool_call.function.name = name.clone();
-                                }
                             }
+
                             if let Some(chunk) = &tool_call.function.arguments {
                                 // Convert current arguments to string if needed
                                 let current_args = match &existing_tool_call.function.arguments {
@@ -253,10 +292,8 @@ pub async fn send_streaming_request(
                         }
                     }
 
-                    if let Some(content) = &delta.content {
-                        if !content.is_empty() {
+                    if let Some(content) = &delta.content &&!content.is_empty() {
                             yield Ok(streaming::RawStreamingChoice::Message(content.clone()))
-                        }
                     }
 
                     if let Some(usage) = data.usage {
@@ -281,8 +318,9 @@ pub async fn send_streaming_request(
                             };
                             let index = tool_call.index;
 
-                            tool_calls.insert(index, ToolCall{
+                            tool_calls.insert(index, ToolCall {
                                 id: id.unwrap_or_default(),
+                                call_id: None,
                                 function: ToolFunction {
                                     name: name.unwrap_or_default(),
                                     arguments,
@@ -303,7 +341,8 @@ pub async fn send_streaming_request(
             yield Ok(streaming::RawStreamingChoice::ToolCall{
                 name: tool_call.function.name,
                 id: tool_call.id,
-                arguments: tool_call.function.arguments
+                arguments: tool_call.function.arguments,
+                call_id: None
             });
         }
 
@@ -311,7 +350,174 @@ pub async fn send_streaming_request(
             usage: final_usage.unwrap_or_default()
         }))
 
-    });
+    };
 
-    Ok(streaming::StreamingCompletionResponse::new(stream))
+    Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
+        stream,
+    )))
+}
+
+pub async fn send_streaming_request1(
+    request_builder: RequestBuilder,
+) -> Result<streaming::StreamingCompletionResponse<FinalCompletionResponse>, CompletionError> {
+    let mut event_source = request_builder
+        .eventsource()
+        .expect("Cloning request must always succeed");
+
+    let stream = stream! {
+        // Accumulate tool calls by index while streaming
+        let mut tool_calls: HashMap<usize, ToolCall> = HashMap::new();
+        let mut final_usage = None;
+
+        while let Some(event_result) = event_source.next().await {
+            match event_result {
+                Ok(Event::Open) => {
+                    tracing::trace!("SSE connection opened");
+                    continue;
+                }
+
+                Ok(Event::Message(event_message)) => {
+                    let raw = event_message.data;
+
+                    let parsed = serde_json::from_str::<StreamingCompletionResponse>(&raw);
+                    let Ok(data) = parsed else {
+                        tracing::debug!("Couldn't parse OpenRouter payload as StreamingCompletionResponse; skipping chunk");
+                        continue;
+                    };
+
+                    // Expect at least one choice (keeps original behavior)
+                    let choice = match data.choices.first() {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    // --- Handle delta (streaming updates) ---
+                    if let Some(delta) = &choice.delta {
+                        if !delta.tool_calls.is_empty() {
+                            for tc in &delta.tool_calls {
+                                let index = tc.index;
+
+                                // Ensure entry exists
+                                let existing = tool_calls.entry(index).or_insert_with(|| ToolCall {
+                                    id: String::new(),
+                                    call_id: None,
+                                    function: ToolFunction {
+                                        name: String::new(),
+                                        arguments: Value::Null,
+                                    },
+                                });
+
+                                // Update id if present and non-empty
+                                if let Some(id) = &tc.id && !id.is_empty() {
+                                        existing.id = id.clone();
+                                }
+
+                                // Update name if present and non-empty
+                                if let Some(name) = &tc.function.name && !name.is_empty() {
+                                    existing.function.name = name.clone();
+                                }
+
+                                // Append argument chunk if present
+                                if let Some(chunk) = &tc.function.arguments {
+                                    // Current arguments as string (or empty)
+                                    let current_args = match &existing.function.arguments {
+                                        Value::Null => String::new(),
+                                        Value::String(s) => s.clone(),
+                                        v => v.to_string(),
+                                    };
+
+                                    let combined = format!("{}{}", current_args, chunk);
+
+                                    // If it looks like complete JSON object, try parse
+                                    if combined.trim_start().starts_with('{') && combined.trim_end().ends_with('}') {
+                                        match serde_json::from_str::<Value>(&combined) {
+                                            Ok(parsed_value) => existing.function.arguments = parsed_value,
+                                            Err(_) => existing.function.arguments = Value::String(combined),
+                                        }
+                                    } else {
+                                        existing.function.arguments = Value::String(combined);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Streamed text content
+                        if let Some(content) = &delta.content && !content.is_empty() {
+                            yield Ok(streaming::RawStreamingChoice::Message(content.clone()));
+                        }
+
+                        // usage update (if present)
+                        if let Some(usage) = data.usage {
+                            final_usage = Some(usage);
+                        }
+                    }
+
+                    // --- Handle message (final/other message structure) ---
+                    if let Some(message) = &choice.message {
+                        if !message.tool_calls.is_empty() {
+                            for tc in &message.tool_calls {
+                                let idx = tc.index;
+                                let name = tc.function.name.clone().unwrap_or_default();
+                                let id = tc.id.clone().unwrap_or_default();
+
+                                let args_value = if let Some(args_str) = &tc.function.arguments {
+                                    match serde_json::from_str::<Value>(args_str) {
+                                        Ok(v) => v,
+                                        Err(_) => Value::String(args_str.clone()),
+                                    }
+                                } else {
+                                    Value::Null
+                                };
+
+                                tool_calls.insert(idx, ToolCall {
+                                    id,
+                                    call_id: None,
+                                    function: ToolFunction {
+                                        name,
+                                        arguments: args_value,
+                                    },
+                                });
+                            }
+                        }
+
+                        if !message.content.is_empty() {
+                            yield Ok(streaming::RawStreamingChoice::Message(message.content.clone()));
+                        }
+                    }
+                }
+
+                Err(reqwest_eventsource::Error::StreamEnded) => {
+                    break;
+                }
+
+                Err(error) => {
+                    tracing::error!(?error, "SSE error from OpenRouter event source");
+                    yield Err(CompletionError::ResponseError(error.to_string()));
+                    break;
+                }
+            }
+        }
+
+        // Ensure event source is closed when stream ends
+        event_source.close();
+
+        // Flush any accumulated tool calls (that weren't emitted as ToolCall earlier)
+        for (_idx, tool_call) in tool_calls.into_iter() {
+            yield Ok(streaming::RawStreamingChoice::ToolCall {
+                name: tool_call.function.name,
+                id: tool_call.id,
+                arguments: tool_call.function.arguments,
+                call_id: None,
+            });
+        }
+
+        // Final response with usage
+        yield Ok(streaming::RawStreamingChoice::FinalResponse(FinalCompletionResponse {
+            usage: final_usage.unwrap_or_default(),
+        }));
+    };
+
+    Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
+        stream,
+    )))
 }

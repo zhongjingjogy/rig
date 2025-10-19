@@ -11,17 +11,23 @@
 
 use crate::eternalai_system_prompt_manager_toolset;
 use crate::json_utils;
+use async_stream::stream;
+use rig::OneOrMany;
 use rig::agent::AgentBuilder;
+use rig::client::ClientBuilderError;
+use rig::completion::GetTokenUsage;
 use rig::completion::{CompletionError, CompletionRequest};
 use rig::embeddings::{EmbeddingError, EmbeddingsBuilder};
 use rig::extractor::ExtractorBuilder;
+use rig::http_client;
 use rig::message;
+use rig::message::AssistantContent;
 use rig::providers::openai::{self, Message};
-use rig::OneOrMany;
-use rig::{completion, embeddings, Embed};
+use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
+use rig::{Embed, completion, embeddings};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::ffi::c_uint;
 use std::time::Duration;
 
@@ -30,37 +36,79 @@ use std::time::Duration;
 // ================================================================
 const ETERNALAI_API_BASE_URL: &str = "https://api.eternalai.org/v1";
 
+pub struct ClientBuilder<'a> {
+    api_key: &'a str,
+    base_url: &'a str,
+    http_client: Option<reqwest::Client>,
+}
+
+impl<'a> ClientBuilder<'a> {
+    pub fn new(api_key: &'a str) -> Self {
+        Self {
+            api_key,
+            base_url: ETERNALAI_API_BASE_URL,
+            http_client: None,
+        }
+    }
+
+    pub fn base_url(mut self, base_url: &'a str) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    pub fn custom_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    pub fn build(self) -> Result<Client, ClientBuilderError> {
+        let http_client = if let Some(http_client) = self.http_client {
+            http_client
+        } else {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?
+        };
+
+        Ok(Client {
+            api_key: self.api_key.to_string(),
+            base_url: self.base_url.to_string(),
+            http_client,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
+    api_key: String,
     base_url: String,
     http_client: reqwest::Client,
 }
 
 impl Client {
-    /// Create a new EternalAI client with the given API key.
-    pub fn new(api_key: &str) -> Self {
-        Self::from_url(api_key, ETERNALAI_API_BASE_URL)
+    /// Create a new EternalAI client builder.
+    ///
+    /// # Example
+    /// ```
+    /// use rig_eternalai::providers::eternalai::{ClientBuilder, self};
+    ///
+    /// // Initialize the EternalAI client
+    /// let eternalai = Client::builder("your-eternalai-api-key")
+    ///    .build()
+    /// ```
+    pub fn builder(api_key: &str) -> ClientBuilder<'_> {
+        ClientBuilder::new(api_key)
     }
 
-    /// Create a new EternalAI client with the given API key and base API URL.
-    pub fn from_url(api_key: &str, base_url: &str) -> Self {
-        Self {
-            base_url: base_url.to_string(),
-            http_client: reqwest::Client::builder()
-                .default_headers({
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        format!("Bearer {}", api_key)
-                            .parse()
-                            .expect("Bearer token should parse"),
-                    );
-                    headers
-                })
-                .timeout(Duration::from_secs(120))
-                .build()
-                .expect("EternalAI reqwest client should build"),
-        }
+    /// Create a new EternalAI client. For more control, use the `builder` method.
+    ///
+    /// # Panics
+    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
+    pub fn new(api_key: &str) -> Self {
+        Self::builder(api_key)
+            .base_url(ETERNALAI_API_BASE_URL)
+            .build()
+            .expect("EternalAI client should build")
     }
 
     /// Create a new EternalAI client from the `ETERNALAI_API_KEY` environment variable.
@@ -70,9 +118,9 @@ impl Client {
         Self::new(&api_key)
     }
 
-    fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url)
+    pub(crate) fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        self.http_client.post(url).bearer_auth(&self.api_key)
     }
 
     /// Create an embedding model with the given name.
@@ -169,7 +217,7 @@ impl Client {
     pub fn extractor<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync>(
         &self,
         model: &str,
-    ) -> ExtractorBuilder<T, CompletionModel> {
+    ) -> ExtractorBuilder<CompletionModel, T> {
         ExtractorBuilder::new(self.completion_model(model, None))
     }
 }
@@ -226,7 +274,7 @@ pub struct EmbeddingData {
     pub index: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
@@ -270,10 +318,15 @@ impl embeddings::EmbeddingModel for EmbeddingModel {
                 "input": documents,
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|e| EmbeddingError::HttpError(http_client::Error::Instance(e.into())))?;
 
         if response.status().is_success() {
-            match response.json::<ApiResponse<EmbeddingResponse>>().await? {
+            match response
+                .json::<ApiResponse<EmbeddingResponse>>()
+                .await
+                .map_err(|e| EmbeddingError::HttpError(http_client::Error::Instance(e.into())))?
+            {
                 ApiResponse::Ok(response) => {
                     tracing::info!(target: "rig",
                         "EternalAI embedding token usage: {}",
@@ -299,7 +352,11 @@ impl embeddings::EmbeddingModel for EmbeddingModel {
                 ApiResponse::Err(err) => Err(EmbeddingError::ProviderError(err.message)),
             }
         } else {
-            Err(EmbeddingError::ProviderError(response.text().await?))
+            Err(EmbeddingError::ProviderError(
+                response.text().await.map_err(|e| {
+                    EmbeddingError::HttpError(http_client::Error::Instance(e.into()))
+                })?,
+            ))
         }
     }
 }
@@ -335,7 +392,7 @@ pub fn get_chain_id(key: &str) -> Option<&str> {
     None
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String,
@@ -345,6 +402,18 @@ pub struct CompletionResponse {
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
     pub onchain_data: Option<Value>,
+}
+
+impl GetTokenUsage for CompletionResponse {
+    fn token_usage(&self) -> Option<rig::completion::Usage> {
+        let api_usage = self.usage.clone()?;
+        let mut usage = rig::completion::Usage::new();
+
+        usage.input_tokens = api_usage.prompt_tokens as u64;
+        usage.total_tokens = api_usage.total_tokens as u64;
+        usage.output_tokens = (api_usage.total_tokens - api_usage.prompt_tokens) as u64;
+        Some(usage)
+    }
 }
 
 impl From<ApiErrorResponse> for CompletionError {
@@ -402,15 +471,25 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 "Response contained no message or tool call (empty)".to_owned(),
             )
         })?;
+        let usage = response
+            .usage
+            .as_ref()
+            .map(|usage| completion::Usage {
+                input_tokens: usage.prompt_tokens as u64,
+                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                total_tokens: usage.total_tokens as u64,
+            })
+            .unwrap_or_default();
 
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Choice {
     pub index: usize,
     pub message: Message,
@@ -466,6 +545,7 @@ impl CompletionModel {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = CompletionResponse;
 
     async fn completion(
         &self,
@@ -561,10 +641,15 @@ impl completion::CompletionModel for CompletionModel {
                 },
             )
             .send()
-            .await?;
+            .await
+            .map_err(|e| CompletionError::HttpError(http_client::Error::Instance(e.into())))?;
 
         if response.status().is_success() {
-            match response.json::<ApiResponse<CompletionResponse>>().await? {
+            match response
+                .json::<ApiResponse<CompletionResponse>>()
+                .await
+                .map_err(|e| CompletionError::HttpError(http_client::Error::Instance(e.into())))?
+            {
                 ApiResponse::Ok(response) => {
                     tracing::info!(target: "rig",
                         "EternalAI completion token usage: {:?}",
@@ -584,7 +669,43 @@ impl completion::CompletionModel for CompletionModel {
                 ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
             }
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            Err(CompletionError::ProviderError(
+                response.text().await.map_err(|e| {
+                    CompletionError::HttpError(http_client::Error::Instance(e.into()))
+                })?,
+            ))
         }
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let resp = self.completion(request).await?;
+
+        let stream = Box::pin(stream! {
+            for c in resp.choice {
+                match &c {
+                    AssistantContent::Text(text) => {
+                        yield Ok(RawStreamingChoice::Message(text.text.clone()))
+                    }
+                    AssistantContent::ToolCall(tc) => {
+                        yield Ok(RawStreamingChoice::ToolCall {
+                            id: tc.id.clone(),
+                            call_id: None,
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        })
+                    }
+                    AssistantContent::Reasoning(_) => {
+                        unimplemented!("Reasoning is currently unimplemented on Eternal AI. If you need this, please open a ticket!")
+                    }
+                }
+            }
+
+            yield Ok(RawStreamingChoice::FinalResponse(resp.raw_response.clone()));
+        });
+
+        Ok(StreamingCompletionResponse::stream(stream))
     }
 }

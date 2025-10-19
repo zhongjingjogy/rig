@@ -1,13 +1,15 @@
 use qdrant_client::{
-    qdrant::{
-        point_id::PointIdOptions, PointId, PointStruct, Query, QueryPoints, UpsertPointsBuilder,
-    },
     Payload, Qdrant,
+    qdrant::{
+        PointId, PointStruct, Query, QueryPoints, UpsertPointsBuilder, point_id::PointIdOptions,
+    },
 };
 use rig::{
-    embeddings::{Embedding, EmbeddingModel},
-    vector_store::{VectorStoreError, VectorStoreIndex},
     Embed, OneOrMany,
+    embeddings::{Embedding, EmbeddingModel},
+    vector_store::{
+        InsertDocuments, VectorStoreError, VectorStoreIndex, request::VectorSearchRequest,
+    },
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,7 +24,10 @@ pub struct QdrantVectorStore<M: EmbeddingModel> {
     query_params: QueryPoints,
 }
 
-impl<M: EmbeddingModel> QdrantVectorStore<M> {
+impl<M> QdrantVectorStore<M>
+where
+    M: EmbeddingModel,
+{
     /// Creates a new instance of `QdrantVectorStore`.
     ///
     /// # Arguments
@@ -49,14 +54,25 @@ impl<M: EmbeddingModel> QdrantVectorStore<M> {
     }
 
     /// Fill in query parameters with the given query and limit.
-    fn prepare_query_params(&self, query: Option<Query>, limit: usize) -> QueryPoints {
+    fn prepare_query_params(
+        &self,
+        query: Option<Query>,
+        limit: usize,
+        threshold: Option<f64>,
+    ) -> QueryPoints {
         let mut params = self.query_params.clone();
         params.query = query;
         params.limit = Some(limit as u64);
+        params.score_threshold = threshold.map(|x| x as f32);
         params
     }
+}
 
-    pub async fn insert_documents<Doc: Serialize + Embed + Send>(
+impl<Model> InsertDocuments for QdrantVectorStore<Model>
+where
+    Model: EmbeddingModel + Send + Sync,
+{
+    async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, OneOrMany<Embedding>)>,
     ) -> Result<(), VectorStoreError> {
@@ -100,20 +116,24 @@ fn stringify_id(id: PointId) -> Result<String, VectorStoreError> {
     }
 }
 
-impl<M: EmbeddingModel + std::marker::Sync + Send> VectorStoreIndex for QdrantVectorStore<M> {
+impl<M> VectorStoreIndex for QdrantVectorStore<M>
+where
+    M: EmbeddingModel + std::marker::Sync + Send,
+{
     /// Search for the top `n` nearest neighbors to the given query within the Qdrant vector store.
     /// Returns a vector of tuples containing the score, ID, and payload of the nearest neighbors.
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
         let query = match self.query_params.query {
             Some(ref q) => Some(q.clone()),
-            None => Some(Query::new_nearest(self.generate_query_vector(query).await?)),
+            None => Some(Query::new_nearest(
+                self.generate_query_vector(req.query()).await?,
+            )),
         };
 
-        let params = self.prepare_query_params(query, n);
+        let params = self.prepare_query_params(query, req.samples() as usize, req.threshold());
         let result = self
             .client
             .query(params)
@@ -139,15 +159,16 @@ impl<M: EmbeddingModel + std::marker::Sync + Send> VectorStoreIndex for QdrantVe
     /// Returns a vector of tuples containing the score and ID of the nearest neighbors.
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
         let query = match self.query_params.query {
             Some(ref q) => Some(q.clone()),
-            None => Some(Query::new_nearest(self.generate_query_vector(query).await?)),
+            None => Some(Query::new_nearest(
+                self.generate_query_vector(req.query()).await?,
+            )),
         };
 
-        let params = self.prepare_query_params(query, n);
+        let params = self.prepare_query_params(query, req.samples() as usize, req.threshold());
         let points = self
             .client
             .query(params)

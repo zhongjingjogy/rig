@@ -1,11 +1,16 @@
+//! Everything related to core image generation abstractions in Rig.
+//! Rig allows calling a number of different providers (that support image generation) using the [ImageGenerationModel] trait.
+use crate::{client::image_generation::ImageGenerationModelHandle, http_client};
+use futures::future::BoxFuture;
 use serde_json::Value;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ImageGenerationError {
     /// Http error (e.g.: connection error, timeout, etc.)
     #[error("HttpError: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(#[from] http_client::Error),
 
     /// Json error (e.g.: serialization, deserialization)
     #[error("JsonError: {0}")]
@@ -23,7 +28,10 @@ pub enum ImageGenerationError {
     #[error("ProviderError: {0}")]
     ProviderError(String),
 }
-pub trait ImageGeneration<M: ImageGenerationModel> {
+pub trait ImageGeneration<M>
+where
+    M: ImageGenerationModel,
+{
     /// Generates a transcription request builder for the given `file`.
     /// This function is meant to be called by the user to further customize the
     /// request at transcription time before sending it.
@@ -41,6 +49,7 @@ pub trait ImageGeneration<M: ImageGenerationModel> {
     > + Send;
 }
 
+/// A unified response for a model image generation, returning both the image and the raw response.
 #[derive(Debug)]
 pub struct ImageGenerationResponse<T> {
     pub image: Vec<u8>,
@@ -62,6 +71,45 @@ pub trait ImageGenerationModel: Clone + Send + Sync {
     }
 }
 
+pub trait ImageGenerationModelDyn: Send + Sync {
+    fn image_generation(
+        &self,
+        request: ImageGenerationRequest,
+    ) -> BoxFuture<'_, Result<ImageGenerationResponse<()>, ImageGenerationError>>;
+
+    fn image_generation_request(
+        &self,
+    ) -> ImageGenerationRequestBuilder<ImageGenerationModelHandle<'_>>;
+}
+
+impl<T> ImageGenerationModelDyn for T
+where
+    T: ImageGenerationModel,
+{
+    fn image_generation(
+        &self,
+        request: ImageGenerationRequest,
+    ) -> BoxFuture<'_, Result<ImageGenerationResponse<()>, ImageGenerationError>> {
+        Box::pin(async {
+            let resp = self.image_generation(request).await;
+            resp.map(|r| ImageGenerationResponse {
+                image: r.image,
+                response: (),
+            })
+        })
+    }
+
+    fn image_generation_request(
+        &self,
+    ) -> ImageGenerationRequestBuilder<ImageGenerationModelHandle<'_>> {
+        ImageGenerationRequestBuilder::new(ImageGenerationModelHandle {
+            inner: Arc::new(self.clone()),
+        })
+    }
+}
+
+/// An image generation request.
+#[non_exhaustive]
 pub struct ImageGenerationRequest {
     pub prompt: String,
     pub width: u32,
@@ -69,7 +117,13 @@ pub struct ImageGenerationRequest {
     pub additional_params: Option<Value>,
 }
 
-pub struct ImageGenerationRequestBuilder<M: ImageGenerationModel> {
+/// A builder for `ImageGenerationRequest`.
+/// Can be sent to a model provider.
+#[non_exhaustive]
+pub struct ImageGenerationRequestBuilder<M>
+where
+    M: ImageGenerationModel,
+{
     model: M,
     prompt: String,
     width: u32,
@@ -77,7 +131,10 @@ pub struct ImageGenerationRequestBuilder<M: ImageGenerationModel> {
     additional_params: Option<Value>,
 }
 
-impl<M: ImageGenerationModel> ImageGenerationRequestBuilder<M> {
+impl<M> ImageGenerationRequestBuilder<M>
+where
+    M: ImageGenerationModel,
+{
     pub fn new(model: M) -> Self {
         Self {
             model,

@@ -1,9 +1,12 @@
+use rig::prelude::*;
 use rig::{
     completion::{Prompt, ToolDefinition},
     providers,
     tool::Tool,
 };
+
 use serde::{Deserialize, Serialize};
+
 use serde_json::json;
 
 #[tokio::main]
@@ -15,8 +18,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .init();
 
     // Initialize the Mira client using environment variables
-    let client = providers::mira::Client::from_env()
-        .map_err(|e| anyhow::anyhow!("Failed to initialize Mira client: {}", e))?;
+    let client = providers::mira::Client::from_env();
 
     // Test API connection first by listing models
     println!("\nTesting API connection by listing models...");
@@ -25,12 +27,15 @@ async fn main() -> Result<(), anyhow::Error> {
             println!("Successfully connected to Mira API!");
             println!("Available models:");
             for model in models {
-                println!("- {}", model);
+                println!("- {model}");
             }
             println!("\nProceeding with chat completion...\n");
         }
         Err(e) => {
-            return Err(anyhow::anyhow!("Failed to connect to Mira API: {}. Please verify your API key and network connection.", e));
+            return Err(anyhow::anyhow!(
+                "Failed to connect to Mira API: {}. Please verify your API key and network connection.",
+                e
+            ));
         }
     }
 
@@ -43,7 +48,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Send a message and get response
     let response = agent.prompt("What are the 7 wonders of the world?").await?;
-    println!("Basic Agent Response: {}", response);
+    println!("Basic Agent Response: {response}");
 
     // Create a calculator agent with tools
     let calculator_agent = client
@@ -60,7 +65,6 @@ async fn main() -> Result<(), anyhow::Error> {
         "Mira Calculator Agent: {}",
         calculator_agent.prompt("Calculate 15 - 7").await?
     );
-
     Ok(())
 }
 
@@ -76,9 +80,9 @@ struct MathError;
 
 #[derive(Deserialize, Serialize)]
 struct Adder;
+
 impl Tool for Adder {
     const NAME: &'static str = "add";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -108,12 +112,11 @@ impl Tool for Adder {
         Ok(result)
     }
 }
-
 #[derive(Deserialize, Serialize)]
 struct Subtract;
+
 impl Tool for Subtract {
     const NAME: &'static str = "subtract";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;

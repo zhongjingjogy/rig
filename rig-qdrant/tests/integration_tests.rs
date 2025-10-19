@@ -1,20 +1,21 @@
 use serde_json::json;
 use testcontainers::{
+    GenericImage,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage,
 };
 
 use qdrant_client::{
+    Payload, Qdrant,
     qdrant::{
         CreateCollectionBuilder, Distance, PointStruct, QueryPointsBuilder, UpsertPointsBuilder,
         VectorParamsBuilder,
     },
-    Payload, Qdrant,
 };
 use rig::{
-    embeddings::EmbeddingsBuilder, providers::openai, vector_store::VectorStoreIndex, Embed,
+    Embed, embeddings::EmbeddingsBuilder, providers::openai, vector_store::VectorStoreIndex,
 };
+use rig::{client::EmbeddingsClient, vector_store::request::VectorSearchRequest};
 use rig_qdrant::QdrantVectorStore;
 
 const QDRANT_PORT: u16 = 6333;
@@ -78,6 +79,7 @@ async fn vector_search_test() {
                     "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans."
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -117,6 +119,7 @@ async fn vector_search_test() {
                     "What is a linglingdong?"
                 ],
                 "model": "text-embedding-ada-002",
+                "dimensions": 1536,
             }));
         then.status(200)
             .header("content-type", "application/json")
@@ -139,7 +142,9 @@ async fn vector_search_test() {
     });
 
     // Initialize OpenAI client
-    let openai_client = openai::Client::from_url("TEST", &server.base_url());
+    let openai_client = openai::Client::builder("TEST")
+        .base_url(&server.base_url())
+        .build();
     // let openai_client = openai::Client::from_env();
 
     let model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
@@ -154,10 +159,14 @@ async fn vector_search_test() {
     let query_params = QueryPointsBuilder::new(COLLECTION_NAME).with_payload(true);
     let vector_store = QdrantVectorStore::new(client, model, query_params.build());
 
-    let results = vector_store
-        .top_n::<serde_json::Value>("What is a linglingdong?", 1)
-        .await
-        .unwrap();
+    let query = "What is a linglingdong?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()
+        .expect("VectorSearchRequest should not fail to build here");
+
+    let results = vector_store.top_n::<serde_json::Value>(req).await.unwrap();
 
     let (_, _, value) = &results.first().unwrap();
 

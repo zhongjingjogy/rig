@@ -2,26 +2,34 @@
 //! It provides traits, structs, and enums for generating audio transcription requests,
 //! handling transcription responses, and defining transcription models.
 
+use crate::client::transcription::TranscriptionModelHandle;
+use crate::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
+use crate::{http_client, json_utils};
+use std::sync::Arc;
 use std::{fs, path::Path};
-
 use thiserror::Error;
-
-use crate::json_utils;
 
 // Errors
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TranscriptionError {
     /// Http error (e.g.: connection error, timeout, etc.)
     #[error("HttpError: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(#[from] http_client::Error),
 
     /// Json error (e.g.: serialization, deserialization)
     #[error("JsonError: {0}")]
     JsonError(#[from] serde_json::Error),
 
+    #[cfg(not(target_family = "wasm"))]
     /// Error building the transcription request
     #[error("RequestError: {0}")]
     RequestError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    #[cfg(target_family = "wasm")]
+    /// Error building the transcription request
+    #[error("RequestError: {0}")]
+    RequestError(#[from] Box<dyn std::error::Error + 'static>),
 
     /// Error parsing the transcription response
     #[error("ResponseError: {0}")]
@@ -33,7 +41,10 @@ pub enum TranscriptionError {
 }
 
 /// Trait defining a low-level LLM transcription interface
-pub trait Transcription<M: TranscriptionModel> {
+pub trait Transcription<M>
+where
+    M: TranscriptionModel,
+{
     /// Generates a transcription request builder for the given `file`.
     /// This function is meant to be called by the user to further customize the
     /// request at transcription time before sending it.
@@ -46,8 +57,9 @@ pub trait Transcription<M: TranscriptionModel> {
         &self,
         filename: &str,
         data: &[u8],
-    ) -> impl std::future::Future<Output = Result<TranscriptionRequestBuilder<M>, TranscriptionError>>
-           + Send;
+    ) -> impl std::future::Future<
+        Output = Result<TranscriptionRequestBuilder<M>, TranscriptionError>,
+    > + WasmCompatSend;
 }
 
 /// General transcription response struct that contains the transcription text
@@ -60,9 +72,9 @@ pub struct TranscriptionResponse<T> {
 /// Trait defining a transcription model that can be used to generate transcription requests.
 /// This trait is meant to be implemented by the user to define a custom transcription model,
 /// either from a third-party provider (e.g: OpenAI) or a local model.
-pub trait TranscriptionModel: Clone + Send + Sync {
+pub trait TranscriptionModel: Clone + WasmCompatSend + WasmCompatSync {
     /// The raw response type returned by the underlying model.
-    type Response: Sync + Send;
+    type Response: WasmCompatSend + WasmCompatSync;
 
     /// Generates a completion response for the given transcription model
     fn transcription(
@@ -70,11 +82,45 @@ pub trait TranscriptionModel: Clone + Send + Sync {
         request: TranscriptionRequest,
     ) -> impl std::future::Future<
         Output = Result<TranscriptionResponse<Self::Response>, TranscriptionError>,
-    > + Send;
+    > + WasmCompatSend;
 
     /// Generates a transcription request builder for the given `file`
     fn transcription_request(&self) -> TranscriptionRequestBuilder<Self> {
         TranscriptionRequestBuilder::new(self.clone())
+    }
+}
+
+pub trait TranscriptionModelDyn: WasmCompatSend + WasmCompatSync {
+    fn transcription(
+        &self,
+        request: TranscriptionRequest,
+    ) -> WasmBoxedFuture<'_, Result<TranscriptionResponse<()>, TranscriptionError>>;
+
+    fn transcription_request(&self) -> TranscriptionRequestBuilder<TranscriptionModelHandle<'_>>;
+}
+
+impl<T> TranscriptionModelDyn for T
+where
+    T: TranscriptionModel,
+{
+    fn transcription(
+        &self,
+        request: TranscriptionRequest,
+    ) -> WasmBoxedFuture<'_, Result<TranscriptionResponse<()>, TranscriptionError>> {
+        Box::pin(async move {
+            let resp = self.transcription(request).await?;
+
+            Ok(TranscriptionResponse {
+                text: resp.text,
+                response: (),
+            })
+        })
+    }
+
+    fn transcription_request(&self) -> TranscriptionRequestBuilder<TranscriptionModelHandle<'_>> {
+        TranscriptionRequestBuilder::new(TranscriptionModelHandle {
+            inner: Arc::new(self.clone()),
+        })
     }
 }
 
@@ -136,7 +182,10 @@ pub struct TranscriptionRequest {
 ///
 /// Note: It is usually unnecessary to create a completion request builder directly.
 /// Instead, use the [TranscriptionModel::transcription_request] method.
-pub struct TranscriptionRequestBuilder<M: TranscriptionModel> {
+pub struct TranscriptionRequestBuilder<M>
+where
+    M: TranscriptionModel,
+{
     model: M,
     data: Vec<u8>,
     filename: Option<String>,
@@ -146,7 +195,10 @@ pub struct TranscriptionRequestBuilder<M: TranscriptionModel> {
     additional_params: Option<serde_json::Value>,
 }
 
-impl<M: TranscriptionModel> TranscriptionRequestBuilder<M> {
+impl<M> TranscriptionRequestBuilder<M>
+where
+    M: TranscriptionModel,
+{
     pub fn new(model: M) -> Self {
         TranscriptionRequestBuilder {
             model,

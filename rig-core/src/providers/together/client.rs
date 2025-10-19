@@ -1,67 +1,197 @@
+use super::{M2_BERT_80M_8K_RETRIEVAL, completion::CompletionModel, embedding::EmbeddingModel};
 use crate::{
-    agent::AgentBuilder,
-    embeddings::{self},
-    extractor::ExtractorBuilder,
-    Embed,
+    client::{EmbeddingsClient, ProviderClient, VerifyClient, VerifyError, impl_conversion_traits},
+    http_client::{self, HttpClientExt},
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-use super::{completion::CompletionModel, embedding::EmbeddingModel, M2_BERT_80M_8K_RETRIEVAL};
+use bytes::Bytes;
+use rig::client::CompletionClient;
 
 // ================================================================
 // Together AI Client
 // ================================================================
 const TOGETHER_AI_BASE_URL: &str = "https://api.together.xyz";
 
-#[derive(Clone)]
-pub struct Client {
-    base_url: String,
-    http_client: reqwest::Client,
+pub struct ClientBuilder<'a, T = reqwest::Client> {
+    api_key: &'a str,
+    base_url: &'a str,
+    http_client: T,
 }
 
-impl Client {
-    /// Create a new Together AI client with the given API key.
-    pub fn new(api_key: &str) -> Self {
-        Self::from_url(api_key, TOGETHER_AI_BASE_URL)
+impl<'a, T> ClientBuilder<'a, T>
+where
+    T: Default,
+{
+    pub fn new(api_key: &'a str) -> Self {
+        Self {
+            api_key,
+            base_url: TOGETHER_AI_BASE_URL,
+            http_client: Default::default(),
+        }
+    }
+}
+
+impl<'a, T> ClientBuilder<'a, T> {
+    pub fn base_url(mut self, base_url: &'a str) -> Self {
+        self.base_url = base_url;
+        self
     }
 
-    fn from_url(api_key: &str, base_url: &str) -> Self {
-        Self {
-            base_url: base_url.to_string(),
-            http_client: reqwest::Client::builder()
-                .default_headers({
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/json".parse().unwrap(),
-                    );
-                    headers.insert(
-                        "Authorization",
-                        format!("Bearer {api_key}")
-                            .parse()
-                            .expect("Bearer token should parse"),
-                    );
-                    headers
-                })
-                .build()
-                .expect("Together AI reqwest client should build"),
+    pub fn with_client<U>(self, http_client: U) -> ClientBuilder<'a, U> {
+        ClientBuilder {
+            api_key: self.api_key,
+            base_url: self.base_url,
+            http_client,
         }
     }
 
+    pub fn build(self) -> Client<T> {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        Client {
+            base_url: self.base_url.to_string(),
+            api_key: self.api_key.to_string(),
+            default_headers,
+            http_client: self.http_client,
+        }
+    }
+}
+#[derive(Clone)]
+pub struct Client<T = reqwest::Client> {
+    base_url: String,
+    default_headers: reqwest::header::HeaderMap,
+    api_key: String,
+    http_client: T,
+}
+
+impl<T> std::fmt::Debug for Client<T>
+where
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("default_headers", &self.default_headers)
+            .field("api_key", &"<REDACTED>")
+            .finish()
+    }
+}
+
+impl<T> Client<T>
+where
+    T: Default,
+{
+    /// Create a new Together AI client builder.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::together_ai::{ClientBuilder, self};
+    ///
+    /// // Initialize the Together AI client
+    /// let together_ai = Client::builder("your-together-ai-api-key")
+    ///    .build()
+    /// ```
+    pub fn builder(api_key: &str) -> ClientBuilder<'_, T> {
+        ClientBuilder::new(api_key)
+    }
+
+    /// Create a new Together AI client. For more control, use the `builder` method.
+    ///
+    /// # Panics
+    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
+    pub fn new(api_key: &str) -> Self {
+        Self::builder(api_key).build()
+    }
+}
+
+impl<T> Client<T>
+where
+    T: HttpClientExt,
+{
+    pub(crate) fn post(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+
+        tracing::debug!("POST {}", url);
+
+        let mut req = http_client::Request::post(url);
+
+        if let Some(hs) = req.headers_mut() {
+            *hs = self.default_headers.clone();
+        }
+
+        http_client::with_bearer_auth(req, &self.api_key)
+    }
+
+    pub(crate) fn get(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
+
+        tracing::debug!("GET {}", url);
+
+        let mut req = http_client::Request::get(url);
+
+        if let Some(hs) = req.headers_mut() {
+            *hs = self.default_headers.clone();
+        }
+
+        http_client::with_bearer_auth(req, &self.api_key)
+    }
+
+    pub(crate) async fn send<U, R>(
+        &self,
+        req: http_client::Request<U>,
+    ) -> http_client::Result<http::Response<http_client::LazyBody<R>>>
+    where
+        U: Into<Bytes> + Send,
+        R: From<Bytes> + Send + 'static,
+    {
+        self.http_client.send(req).await
+    }
+}
+
+impl Client<reqwest::Client> {
+    pub(crate) fn reqwest_post(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
+
+        tracing::debug!("POST {}", url);
+
+        self.http_client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .headers(self.default_headers.clone())
+    }
+}
+
+impl ProviderClient for Client<reqwest::Client> {
     /// Create a new Together AI client from the `TOGETHER_API_KEY` environment variable.
     /// Panics if the environment variable is not set.
-    pub fn from_env() -> Self {
+    fn from_env() -> Self {
         let api_key = std::env::var("TOGETHER_API_KEY").expect("TOGETHER_API_KEY not set");
         Self::new(&api_key)
     }
 
-    pub fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-
-        tracing::debug!("POST {}", url);
-        self.http_client.post(url)
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::Simple(api_key) = input else {
+            panic!("Incorrect provider value type")
+        };
+        Self::new(&api_key)
     }
+}
+
+impl CompletionClient for Client<reqwest::Client> {
+    type CompletionModel = CompletionModel<reqwest::Client>;
+
+    /// Create a completion model with the given name.
+    fn completion_model(&self, model: &str) -> CompletionModel<reqwest::Client> {
+        CompletionModel::new(self.clone(), model)
+    }
+}
+
+impl EmbeddingsClient for Client<reqwest::Client> {
+    type EmbeddingModel = EmbeddingModel<reqwest::Client>;
 
     /// Create an embedding model with the given name.
     /// Note: default embedding dimension of 0 will be used if model is not known.
@@ -76,7 +206,7 @@ impl Client {
     ///
     /// let embedding_model = together_ai.embedding_model(together_ai::embedding::EMBEDDING_V1);
     /// ```
-    pub fn embedding_model(&self, model: &str) -> EmbeddingModel {
+    fn embedding_model(&self, model: &str) -> EmbeddingModel<reqwest::Client> {
         let ndims = match model {
             M2_BERT_80M_8K_RETRIEVAL => 8192,
             _ => 0,
@@ -96,63 +226,41 @@ impl Client {
     ///
     /// let embedding_model = together_ai.embedding_model_with_ndims("model-unknown-to-rig", 1024);
     /// ```
-    pub fn embedding_model_with_ndims(&self, model: &str, ndims: usize) -> EmbeddingModel {
+    fn embedding_model_with_ndims(
+        &self,
+        model: &str,
+        ndims: usize,
+    ) -> EmbeddingModel<reqwest::Client> {
         EmbeddingModel::new(self.clone(), model, ndims)
     }
+}
 
-    /// Create an embedding builder with the given embedding model.
-    ///
-    /// # Example
-    /// ```
-    /// use rig::providers::together_ai::{Client, self};
-    ///
-    /// // Initialize the Together AI client
-    /// let together_ai = Client::new("your-together-ai-api-key");
-    ///
-    /// let embeddings = together_ai.embeddings(together_ai::embedding::EMBEDDING_V1)
-    ///     .simple_document("doc0", "Hello, world!")
-    ///     .simple_document("doc1", "Goodbye, world!")
-    ///     .build()
-    ///     .await
-    ///     .expect("Failed to embed documents");
-    /// ```
-    pub fn embeddings<D: Embed>(
-        &self,
-        model: &str,
-    ) -> embeddings::EmbeddingsBuilder<EmbeddingModel, D> {
-        embeddings::EmbeddingsBuilder::new(self.embedding_model(model))
-    }
+impl VerifyClient for Client<reqwest::Client> {
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn verify(&self) -> Result<(), VerifyError> {
+        let req = self
+            .get("/models")?
+            .body(http_client::NoBody)
+            .map_err(|e| VerifyError::HttpError(e.into()))?;
 
-    /// Create a completion model with the given name.
-    pub fn completion_model(&self, model: &str) -> CompletionModel {
-        CompletionModel::new(self.clone(), model)
-    }
+        let response = HttpClientExt::send(&self.http_client, req).await?;
 
-    /// Create an agent builder with the given completion model.
-    /// # Example
-    /// ```
-    /// use rig::providers::together_ai::{Client, self};
-    ///
-    /// // Initialize the Together AI client
-    /// let together_ai = Client::new("your-together-ai-api-key");
-    ///
-    /// let agent = together_ai.agent(together_ai::completion::MODEL_NAME)
-    ///    .preamble("You are comedian AI with a mission to make people laugh.")
-    ///    .temperature(0.0)
-    ///    .build();
-    /// ```
-    pub fn agent(&self, model: &str) -> AgentBuilder<CompletionModel> {
-        AgentBuilder::new(self.completion_model(model))
-    }
-
-    /// Create an extractor builder with the given completion model.
-    pub fn extractor<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync>(
-        &self,
-        model: &str,
-    ) -> ExtractorBuilder<T, CompletionModel> {
-        ExtractorBuilder::new(self.completion_model(model))
+        match response.status() {
+            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => Err(VerifyError::InvalidAuthentication),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR | reqwest::StatusCode::GATEWAY_TIMEOUT => {
+                let text = http_client::text(response).await?;
+                Err(VerifyError::ProviderError(text))
+            }
+            _ => {
+                //response.error_for_status()?;
+                Ok(())
+            }
+        }
     }
 }
+
+impl_conversion_traits!(AsTranscription, AsImageGeneration, AsAudioGeneration for Client<T>);
 
 pub mod together_ai_api_types {
     use serde::Deserialize;

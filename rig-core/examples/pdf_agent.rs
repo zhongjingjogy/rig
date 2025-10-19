@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use rig::integrations::cli_chatbot::ChatBotBuilder;
+use rig::prelude::*;
 use rig::{
-    embeddings::EmbeddingsBuilder, loaders::PdfFileLoader, providers::openai,
-    vector_store::in_memory_store::InMemoryVectorStore, Embed,
+    Embed, embeddings::EmbeddingsBuilder, loaders::PdfFileLoader, providers::openai,
+    vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -15,14 +17,13 @@ struct Document {
 
 fn load_pdf(path: PathBuf) -> Result<Vec<String>> {
     const CHUNK_SIZE: usize = 2000;
-
     let content_chunks = PdfFileLoader::with_glob(path.to_str().context("Invalid path")?)?
         .read()
         .into_iter()
         .filter_map(|result| {
             result
                 .map_err(|e| {
-                    eprintln!("Error reading PDF content: {}", e);
+                    eprintln!("Error reading PDF content: {e}");
                     e
                 })
                 .ok()
@@ -30,7 +31,6 @@ fn load_pdf(path: PathBuf) -> Result<Vec<String>> {
         .flat_map(|content| {
             let mut chunks = Vec::new();
             let mut current = String::new();
-
             for word in content.split_whitespace() {
                 if current.len() + word.len() + 1 > CHUNK_SIZE && !current.is_empty() {
                     chunks.push(std::mem::take(&mut current).trim().to_string());
@@ -38,33 +38,29 @@ fn load_pdf(path: PathBuf) -> Result<Vec<String>> {
                 current.push_str(word);
                 current.push(' ');
             }
-
             if !current.is_empty() {
                 chunks.push(current.trim().to_string());
             }
-
             chunks
         })
         .collect::<Vec<_>>();
-
     if content_chunks.is_empty() {
         anyhow::bail!("No content found in PDF file: {}", path.display());
     }
-
     Ok(content_chunks)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize Ollama client
-    let client = openai::Client::from_url("ollama", "http://localhost:11434/v1");
+    let client = openai::Client::builder("ollama")
+        .base_url("http://localhost:11434/v1")
+        .build();
 
     // Load PDFs using Rig's built-in PDF loader
     let documents_dir = std::env::current_dir()?.join("rig-core/examples/documents");
-
     let pdf_chunks =
         load_pdf(documents_dir.join("deepseek_r1.pdf")).context("Failed to load pdf documents")?;
-
     println!("Successfully loaded and chunked PDF documents");
 
     // Create embedding model
@@ -76,20 +72,18 @@ async fn main() -> Result<()> {
     // Add chunks from pdf documents
     for (i, chunk) in pdf_chunks.into_iter().enumerate() {
         builder = builder.document(Document {
-            id: format!("pdf_document_{}", i),
+            id: format!("pdf_document_{i}"),
             content: chunk,
         })?;
     }
 
     // Build embeddings
     let embeddings = builder.build().await?;
-
     println!("Successfully generated embeddings");
 
     // Create vector store and index
     let vector_store = InMemoryVectorStore::from_documents(embeddings);
     let index = vector_store.index(model);
-
     println!("Successfully created vector store and index");
 
     // Create RAG agent
@@ -102,7 +96,12 @@ async fn main() -> Result<()> {
     println!("Starting CLI chatbot...");
 
     // Start interactive CLI
-    rig::cli_chatbot::cli_chatbot(rag_agent).await?;
+    let chatbot = ChatBotBuilder::new()
+        .agent(rag_agent)
+        .multi_turn_depth(10)
+        .build();
+
+    chatbot.run().await?;
 
     Ok(())
 }

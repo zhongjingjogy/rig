@@ -2,13 +2,13 @@ use anyhow::Result;
 use rig::{
     completion::{Prompt, ToolDefinition},
     embeddings::EmbeddingsBuilder,
+    prelude::*,
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
     tool::{Tool, ToolEmbedding, ToolSet},
     vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
 
 #[derive(Deserialize)]
 struct OperationArgs {
@@ -140,8 +140,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .init();
 
     // Create OpenAI client
-    let openai_api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
-    let openai_client = Client::new(&openai_api_key);
+    let openai_client = Client::from_env();
 
     let embedding_model = openai_client.embedding_model(TEXT_EMBEDDING_ADA_002);
 
@@ -180,7 +179,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .multi_turn(10)
         .await?;
 
-    println!("{}", response);
+    println!("{response}");
 
     Ok(())
 }

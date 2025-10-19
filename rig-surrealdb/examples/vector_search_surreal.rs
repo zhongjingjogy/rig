@@ -1,4 +1,10 @@
-use rig::{embeddings::EmbeddingsBuilder, vector_store::VectorStoreIndex, Embed};
+use rig::client::{EmbeddingsClient, ProviderClient};
+use rig::vector_store::request::VectorSearchRequest;
+use rig::{
+    Embed,
+    embeddings::EmbeddingsBuilder,
+    vector_store::{InsertDocuments, VectorStoreIndex},
+};
 use rig_surrealdb::{Mem, SurrealVectorStore};
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -59,16 +65,38 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // query vector
     let query = "What does \"glarb-glarb\" mean?";
+    println!("Attempting vector search with query: {query}");
 
-    let results = vector_store.top_n::<WordDefinition>(query, 2).await?;
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(2)
+        .build()?;
 
-    println!("#{} results for query: {}", results.len(), query);
+    let results = vector_store.top_n::<WordDefinition>(req).await?;
+
+    println!("{} results for query: {}", results.len(), query);
     for (distance, _id, doc) in results.iter() {
-        println!("Result distance {} for word: {}", distance, doc);
+        println!("Result distance {distance} for word: {doc}");
 
         // expected output
         // Result distance 0.693218142100547 for word: glarb-glarb
         // Result distance 0.2529120980283861 for word: linglingdong
+    }
+
+    println!("Attempting vector search with cosine similarity threshold of 0.5 and query: {query}");
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(2)
+        .threshold(0.5)
+        .build()?;
+
+    let results = vector_store.top_n::<WordDefinition>(req).await?;
+
+    println!("{} results for query: {}", results.len(), query);
+    assert_eq!(results.len(), 1);
+
+    for (distance, _id, doc) in results.iter() {
+        println!("Result distance {distance} for word: {doc}");
     }
 
     Ok(())

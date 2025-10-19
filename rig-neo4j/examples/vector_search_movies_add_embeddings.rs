@@ -9,13 +9,14 @@ use std::env;
 
 use rig::{
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
-    vector_store::VectorStoreIndex,
+    vector_store::{VectorStoreIndex, request::VectorSearchRequest},
 };
 
 use neo4rs::*;
+use rig::client::EmbeddingsClient;
 use rig_neo4j::{
-    vector_index::{IndexConfig, SearchParams},
     Neo4jClient, ToBoltType,
+    vector_index::{IndexConfig, SearchParams},
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +65,7 @@ async fn main() -> Result<(), anyhow::Error> {
             movies_batch.push(Movie {
                 title: title.to_string(),
                 plot: plot.to_string(),
-                to_encode: Some(format!("Title: {}\nPlot: {}", title, plot)),
+                to_encode: Some(format!("Title: {title}\nPlot: {plot}")),
             });
         }
 
@@ -94,9 +95,8 @@ async fn main() -> Result<(), anyhow::Error> {
         let size: i64 = row.get("embeddingSize")?;
         println!(
             "Embeddings generated and attached to nodes.\n\
-             Movie nodes with embeddings: {}.\n\
-             Embedding size: {}.",
-            count, size
+             Movie nodes with embeddings: {count}.\n\
+             Embedding size: {size}."
         );
     }
 
@@ -117,9 +117,15 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .await?;
 
+    let query = "a historical movie on quebec";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(5)
+        .build()?;
+
     // Query the index
     let results = index
-        .top_n::<Movie>("a historical movie on quebec", 5)
+        .top_n::<Movie>(req)
         .await?
         .into_iter()
         .map(|(score, id, doc)| display::SearchResult {
@@ -132,14 +138,15 @@ async fn main() -> Result<(), anyhow::Error> {
 
     println!("{:#}", display::SearchResults(&results));
 
-    let id_results = index
-        .top_n_ids("What is a linglingdong?", 1)
-        .await?
-        .into_iter()
-        .map(|(score, id)| (score, id))
-        .collect::<Vec<_>>();
+    let query = "What is a linglingdong?";
+    let req = VectorSearchRequest::builder()
+        .query(query)
+        .samples(1)
+        .build()?;
 
-    println!("ID results: {:?}", id_results);
+    let id_results = index.top_n_ids(req).await?.into_iter().collect::<Vec<_>>();
+
+    println!("ID results: {id_results:?}");
 
     Ok(())
 }
@@ -154,14 +161,14 @@ async fn import_batch(graph: &Graph, nodes: &[Movie], batch_n: i32) -> Result<()
     graph.run(
         Query::new(format!(
             "CALL genai.vector.encodeBatch($to_encode_list, 'OpenAI', {{ token: $token }}) YIELD index, vector
-             MATCH (m:{} {{title: $movies[index].title, plot: $movies[index].plot}})
-             CALL db.create.setNodeVectorProperty(m, 'embedding', vector)", NODE_LABEL).to_string()
+             MATCH (m:{NODE_LABEL} {{title: $movies[index].title, plot: $movies[index].plot}})
+             CALL db.create.setNodeVectorProperty(m, 'embedding', vector)").to_string()
         )
         .param("movies", nodes.to_bolt_type())
         .param("to_encode_list", to_encode_list)
         .param("token", openai_api_key)
     ).await?;
 
-    println!("Processed batch {}", batch_n);
+    println!("Processed batch {batch_n}");
     Ok(())
 }

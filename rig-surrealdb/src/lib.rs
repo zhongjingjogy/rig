@@ -1,17 +1,23 @@
 use std::fmt::Display;
 
 use rig::{
-    embeddings::{Embedding, EmbeddingModel},
-    vector_store::{VectorStoreError, VectorStoreIndex},
     Embed, OneOrMany,
+    embeddings::{Embedding, EmbeddingModel},
+    vector_store::{
+        InsertDocuments, VectorStoreError, VectorStoreIndex, request::VectorSearchRequest,
+    },
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use surrealdb::{sql::Thing, Connection, Surreal};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use surrealdb::{Connection, Surreal, sql::Thing};
 
 pub use surrealdb::engine::local::Mem;
 pub use surrealdb::engine::remote::ws::{Ws, Wss};
 
-pub struct SurrealVectorStore<Model: EmbeddingModel, C: Connection> {
+pub struct SurrealVectorStore<C, Model>
+where
+    C: Connection,
+    Model: EmbeddingModel,
+{
     model: Model,
     surreal: Surreal<C>,
     documents_table: String,
@@ -68,7 +74,46 @@ impl SearchResult {
     }
 }
 
-impl<Model: EmbeddingModel, C: Connection> SurrealVectorStore<Model, C> {
+impl<C, Model> InsertDocuments for SurrealVectorStore<C, Model>
+where
+    C: Connection + Send + Sync,
+    Model: EmbeddingModel + Send + Sync,
+{
+    async fn insert_documents<Doc: Serialize + Embed + Send>(
+        &self,
+        documents: Vec<(Doc, OneOrMany<Embedding>)>,
+    ) -> Result<(), VectorStoreError> {
+        for (document, embeddings) in documents {
+            let json_document: serde_json::Value = serde_json::to_value(&document).unwrap();
+            let json_document_as_string = serde_json::to_string(&json_document).unwrap();
+
+            for embedding in embeddings {
+                let embedded_text = embedding.document;
+                let embedding: Vec<f64> = embedding.vec;
+
+                let record = CreateRecord {
+                    document: json_document_as_string.clone(),
+                    embedded_text,
+                    embedding,
+                };
+
+                self.surreal
+                    .create::<Option<CreateRecord>>(self.documents_table.clone())
+                    .content(record)
+                    .await
+                    .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<C, Model> SurrealVectorStore<C, Model>
+where
+    C: Connection,
+    Model: EmbeddingModel,
+{
     pub fn new(
         model: Model,
         surreal: Surreal<C>,
@@ -102,63 +147,41 @@ impl<Model: EmbeddingModel, C: Connection> SurrealVectorStore<Model, C> {
     fn search_query(&self, with_document: bool) -> String {
         let document = if with_document { ", document" } else { "" };
         let embedded_text = if with_document { ", embedded_text" } else { "" };
+
         let Self {
             distance_function, ..
         } = self;
         format!(
             "
-               SELECT id {document} {embedded_text}, {distance_function}($vec, embedding) as distance \
-              from type::table($tablename) order by distance desc \
+            SELECT id {document} {embedded_text}, {distance_function}($vec, embedding) as distance \
+              from type::table($tablename) \
+              where {distance_function}($vec, embedding) >= $threshold \
+              order by distance desc \
             LIMIT $limit",
         )
     }
-
-    pub async fn insert_documents<Doc: Serialize + Embed + Send>(
-        &self,
-        documents: Vec<(Doc, OneOrMany<Embedding>)>,
-    ) -> Result<(), VectorStoreError> {
-        for (document, embeddings) in documents {
-            let json_document: serde_json::Value = serde_json::to_value(&document).unwrap();
-            let json_document_as_string = serde_json::to_string(&json_document).unwrap();
-
-            for embedding in embeddings {
-                let embedded_text = embedding.document;
-                let embedding: Vec<f64> = embedding.vec;
-
-                let record = CreateRecord {
-                    document: json_document_as_string.clone(),
-                    embedded_text,
-                    embedding,
-                };
-
-                self.surreal
-                    .create::<Option<CreateRecord>>(self.documents_table.clone())
-                    .content(record)
-                    .await
-                    .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
-            }
-        }
-
-        Ok(())
-    }
 }
 
-impl<Model: EmbeddingModel, C: Connection> VectorStoreIndex for SurrealVectorStore<Model, C> {
+impl<C, Model> VectorStoreIndex for SurrealVectorStore<C, Model>
+where
+    C: Connection,
+    Model: EmbeddingModel,
+{
     /// Get the top n documents based on the distance to the given query.
     /// The result is a list of tuples of the form (score, id, document)
     async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
-        let embedded_query: Vec<f64> = self.model.embed_text(query).await?.vec;
+        let embedded_query: Vec<f64> = self.model.embed_text(req.query()).await?.vec;
 
         let mut response = self
             .surreal
             .query(self.search_query_full().as_str())
             .bind(("vec", embedded_query))
             .bind(("tablename", self.documents_table.clone()))
-            .bind(("limit", n))
+            .bind(("threshold", req.threshold().unwrap_or(0.)))
+            .bind(("limit", req.samples() as usize))
             .await
             .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
 
@@ -177,12 +200,11 @@ impl<Model: EmbeddingModel, C: Connection> VectorStoreIndex for SurrealVectorSto
     /// Same as `top_n` but returns the document ids only.
     async fn top_n_ids(
         &self,
-        query: &str,
-        n: usize,
+        req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String)>, VectorStoreError> {
         let embedded_query: Vec<f32> = self
             .model
-            .embed_text(query)
+            .embed_text(req.query())
             .await?
             .vec
             .iter()
@@ -194,7 +216,8 @@ impl<Model: EmbeddingModel, C: Connection> VectorStoreIndex for SurrealVectorSto
             .query(self.search_query_only_ids().as_str())
             .bind(("vec", embedded_query))
             .bind(("tablename", self.documents_table.clone()))
-            .bind(("limit", n))
+            .bind(("threshold", req.threshold().unwrap_or(0.)))
+            .bind(("limit", req.samples() as usize))
             .await
             .map_err(|e| VectorStoreError::DatastoreError(Box::new(e)))?;
 

@@ -1,5 +1,6 @@
-use rig::providers::gemini;
 use rig::Embed;
+use rig::prelude::*;
+use rig::providers::gemini;
 
 #[derive(Embed, Debug)]
 struct Greetings {
@@ -25,7 +26,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         .expect("Failed to embed documents");
 
-    println!("{:?}", embeddings);
+    println!("{embeddings:?}");
 
     Ok(())
 }

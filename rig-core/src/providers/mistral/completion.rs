@@ -1,16 +1,20 @@
-use std::{convert::Infallible, str::FromStr};
-
+use async_stream::stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::{convert::Infallible, str::FromStr};
+use tracing::{Instrument, info_span};
 
+use super::client::{Client, Usage};
+use crate::completion::GetTokenUsage;
+use crate::http_client::{self, HttpClientExt};
+use crate::streaming::{RawStreamingChoice, StreamingCompletionResponse};
 use crate::{
+    OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
     json_utils, message,
     providers::mistral::client::ApiResponse,
-    OneOrMany,
+    telemetry::SpanCombinator,
 };
-
-use super::client::{Client, Usage};
 
 pub const CODESTRAL: &str = "codestral-latest";
 pub const MISTRAL_LARGE: &str = "mistral-large-latest";
@@ -41,7 +45,7 @@ pub enum UserContent {
     Text { text: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Choice {
     pub index: usize,
     pub message: Message,
@@ -111,13 +115,16 @@ impl TryFrom<message::Message> for Vec<Message> {
 
                 Ok(messages)
             }
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 let (text_content, tool_calls) = content.into_iter().fold(
                     (Vec::new(), Vec::new()),
                     |(mut texts, mut tools), content| {
                         match content {
                             message::AssistantContent::Text(text) => texts.push(text),
                             message::AssistantContent::ToolCall(tool_call) => tools.push(tool_call),
+                            message::AssistantContent::Reasoning(_) => {
+                                unimplemented!("Reasoning content is not currently supported on Mistral via Rig");
+                            }
                         }
                         (texts, tools)
                     },
@@ -246,13 +253,40 @@ impl FromStr for AssistantContent {
 }
 
 #[derive(Clone)]
-pub struct CompletionModel {
-    pub(crate) client: Client,
+pub struct CompletionModel<T = reqwest::Client> {
+    pub(crate) client: Client<T>,
     pub model: String,
 }
 
-impl CompletionModel {
-    pub fn new(client: Client, model: &str) -> Self {
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+    Any,
+}
+
+impl TryFrom<message::ToolChoice> for ToolChoice {
+    type Error = CompletionError;
+
+    fn try_from(value: message::ToolChoice) -> Result<Self, Self::Error> {
+        let res = match value {
+            message::ToolChoice::Auto => Self::Auto,
+            message::ToolChoice::None => Self::None,
+            message::ToolChoice::Required => Self::Any,
+            message::ToolChoice::Specific { .. } => {
+                return Err(CompletionError::ProviderError(
+                    "Mistral doesn't support requiring specific tools to be called".to_string(),
+                ));
+            }
+        };
+
+        Ok(res)
+    }
+}
+
+impl<T> CompletionModel<T> {
+    pub fn new(client: Client<T>, model: &str) -> Self {
         Self {
             client,
             model: model.to_string(),
@@ -285,6 +319,11 @@ impl CompletionModel {
                 .collect::<Vec<_>>(),
         );
 
+        let tool_choice = completion_request
+            .tool_choice
+            .map(ToolChoice::try_from)
+            .transpose()?;
+
         let request = if completion_request.tools.is_empty() {
             json!({
                 "model": self.model,
@@ -296,7 +335,7 @@ impl CompletionModel {
                 "model": self.model,
                 "messages": full_history,
                 "tools": completion_request.tools.into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
+                "tool_choice": tool_choice,
             })
         };
 
@@ -321,7 +360,7 @@ impl CompletionModel {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String,
@@ -330,6 +369,60 @@ pub struct CompletionResponse {
     pub system_fingerprint: Option<String>,
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
+}
+
+impl crate::telemetry::ProviderResponseExt for CompletionResponse {
+    type OutputMessage = Choice;
+    type Usage = Usage;
+
+    fn get_response_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
+    fn get_response_model_name(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+
+    fn get_output_messages(&self) -> Vec<Self::OutputMessage> {
+        self.choices.clone()
+    }
+
+    fn get_text_response(&self) -> Option<String> {
+        let res = self
+            .choices
+            .iter()
+            .filter_map(|choice| match choice.message {
+                Message::Assistant { ref content, .. } => {
+                    if content.is_empty() {
+                        None
+                    } else {
+                        Some(content.to_string())
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        if res.is_empty() { None } else { Some(res) }
+    }
+
+    fn get_usage(&self) -> Option<Self::Usage> {
+        self.usage.clone()
+    }
+}
+
+impl GetTokenUsage for CompletionResponse {
+    fn token_usage(&self) -> Option<crate::completion::Usage> {
+        let api_usage = self.usage.clone()?;
+
+        let mut usage = crate::completion::Usage::new();
+        usage.input_tokens = api_usage.prompt_tokens as u64;
+        usage.output_tokens = api_usage.completion_tokens as u64;
+        usage.total_tokens = api_usage.total_tokens as u64;
+
+        Some(usage)
+    }
 }
 
 impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionResponse> {
@@ -376,45 +469,121 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )
         })?;
 
+        let usage = response
+            .usage
+            .as_ref()
+            .map(|usage| completion::Usage {
+                input_tokens: usage.prompt_tokens as u64,
+                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                total_tokens: usage.total_tokens as u64,
+            })
+            .unwrap_or_default();
+
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
 }
 
-impl completion::CompletionModel for CompletionModel {
+impl<T> completion::CompletionModel for CompletionModel<T>
+where
+    T: HttpClientExt + Send + Clone + std::fmt::Debug + 'static,
+{
     type Response = CompletionResponse;
+    type StreamingResponse = CompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
         &self,
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
+        let preamble = completion_request.preamble.clone();
         let request = self.create_completion_request(completion_request)?;
+        let body = serde_json::to_vec(&request)?;
 
-        let response = self
-            .client
-            .post("v1/chat/completions")
-            .json(&request)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let text = response.text().await?;
-            match serde_json::from_str::<ApiResponse<CompletionResponse>>(&text)? {
-                ApiResponse::Ok(response) => {
-                    tracing::debug!(target: "rig",
-                        "Mistral completion token usage: {:?}",
-                        response.usage.clone().map(|usage| format!("{usage}")).unwrap_or("N/A".to_string())
-                    );
-                    response.try_into()
-                }
-                ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
-            }
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "mistral",
+                gen_ai.request.model = self.model,
+                gen_ai.system_instructions = &preamble,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = tracing::field::Empty,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = serde_json::to_string(request.get("messages").unwrap()).unwrap(),
+                gen_ai.output.messages = tracing::field::Empty,
+            )
         } else {
-            Err(CompletionError::ProviderError(response.text().await?))
+            tracing::Span::current()
+        };
+
+        let request = self
+            .client
+            .post("v1/chat/completions")?
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| CompletionError::HttpError(e.into()))?;
+
+        async move {
+            let response = self.client.send(request).await?;
+
+            if response.status().is_success() {
+                let text = http_client::text(response).await?;
+                match serde_json::from_str::<ApiResponse<CompletionResponse>>(&text)? {
+                    ApiResponse::Ok(response) => {
+                        let span = tracing::Span::current();
+                        span.record_token_usage(&response);
+                        span.record_model_output(&response.choices);
+                        span.record_response_metadata(&response);
+                        response.try_into()
+                    }
+                    ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
+                }
+            } else {
+                let text = http_client::text(response).await?;
+                Err(CompletionError::ProviderError(text))
+            }
         }
+        .instrument(span)
+        .await
+    }
+
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let resp = self.completion(request).await?;
+
+        let stream = stream! {
+            for c in resp.choice.clone() {
+                match c {
+                    message::AssistantContent::Text(t) => {
+                        yield Ok(RawStreamingChoice::Message(t.text.clone()))
+                    }
+                    message::AssistantContent::ToolCall(tc) => {
+                        yield Ok(RawStreamingChoice::ToolCall {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                             call_id: None
+                        })
+                    }
+                    message::AssistantContent::Reasoning(_) => {
+                        unimplemented!("Reasoning is not supported on Mistral via Rig")
+                    }
+                }
+            }
+
+            yield Ok(RawStreamingChoice::FinalResponse(resp.raw_response.clone()));
+        };
+
+        Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
     }
 }
 

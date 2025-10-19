@@ -1,12 +1,13 @@
 use reqwest::Client;
 
 use rig::{
-    completion::{message::Image, Prompt},
-    message::{ContentFormat, ImageMediaType},
+    completion::{Prompt, message::Image},
+    message::{DocumentSourceKind, ImageMediaType},
 };
 
-use base64::{prelude::BASE64_STANDARD, Engine};
-use rig_bedrock::{client::ClientBuilder, completion::AMAZON_NOVA_LITE};
+use base64::{Engine, prelude::BASE64_STANDARD};
+use rig::client::{CompletionClient, ProviderClient};
+use rig_bedrock::completion::AMAZON_NOVA_LITE;
 use tracing::info;
 
 const IMAGE_URL: &str = "https://playgrounds.network/assets/PG-Logo.png";
@@ -18,7 +19,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_target(false)
         .init();
 
-    let client = ClientBuilder::new().build().await;
+    let client = rig_bedrock::client::Client::from_env();
     let agent = client
         .agent(AMAZON_NOVA_LITE)
         .preamble("You are an image describer.")
@@ -32,9 +33,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Compose `Image` for prompt
     let image = Image {
-        data: image_base64,
+        data: DocumentSourceKind::base64(&image_base64),
         media_type: Some(ImageMediaType::PNG),
-        format: Some(ContentFormat::Base64),
         ..Default::default()
     };
 

@@ -1,7 +1,5 @@
-use std::env;
-
+use rig::prelude::*;
 use rig::providers::openai::client::Client;
-
 use schemars::JsonSchema;
 
 #[derive(serde::Deserialize, JsonSchema, serde::Serialize, Debug)]
@@ -25,8 +23,7 @@ struct TaskResults {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
-    let openai_api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
-    let openai_client = Client::new(&openai_api_key);
+    let openai_client = Client::from_env();
 
     // Note that you can also create your own semantic router for this
     // that uses a vector store under the hood
@@ -65,7 +62,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     let mut vec: Vec<TaskResults> = Vec::new();
-
     for task in specification.tasks {
         let results = content_agent
             .extract(&format!(
@@ -78,7 +74,6 @@ async fn main() -> Result<(), anyhow::Error> {
             ))
             .await
             .unwrap();
-
         vec.push(results);
     }
 
@@ -94,7 +89,6 @@ async fn main() -> Result<(), anyhow::Error> {
         .build();
 
     let task_results_raw_json = serde_json::to_string_pretty(&vec).unwrap();
-
     let results = judge_agent.extract(&task_results_raw_json).await.unwrap();
 
     println!("Results: {results:?}");

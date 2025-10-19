@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.24](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.23...rig-mongodb-v0.2.24) - 2025-10-14
+
+### Added
+
+- *(rig-951)* generic HTTP client ([#875](https://github.com/0xPlaygrounds/rig/pull/875))
+
+### Fixed
+
+- trying to fix test regressions part 2 ([#913](https://github.com/0xPlaygrounds/rig/pull/913))
+- test regression ([#912](https://github.com/0xPlaygrounds/rig/pull/912))
+- *(rig-983)* http request fail due to no content type header set ([#909](https://github.com/0xPlaygrounds/rig/pull/909))
+
+## [0.2.23](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.22...rig-mongodb-v0.2.23) - 2025-09-29
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.22](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.21...rig-mongodb-v0.2.22) - 2025-09-15
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.21](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.20...rig-mongodb-v0.2.21) - 2025-09-02
+
+### Other
+
+- *(rig-907)* use where clause for trait bounds ([#749](https://github.com/0xPlaygrounds/rig/pull/749))
+
+## [0.2.20](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.19...rig-mongodb-v0.2.20) - 2025-08-20
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.19](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.18...rig-mongodb-v0.2.19) - 2025-08-19
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.18](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.17...rig-mongodb-v0.2.18) - 2025-08-19
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.17](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.16...rig-mongodb-v0.2.17) - 2025-08-05
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.16](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.15...rig-mongodb-v0.2.16) - 2025-08-05
+
+### Added
+
+- *(rig-845)* cosine similarity for vector search ([#664](https://github.com/0xPlaygrounds/rig/pull/664))
+
+## [0.2.15](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.14...rig-mongodb-v0.2.15) - 2025-07-30
+
+### Added
+
+- *(rig-819)* vector store index request struct ([#623](https://github.com/0xPlaygrounds/rig/pull/623))
+- *(rig-mongodb)* implement InsertDocuments trait ([#596](https://github.com/0xPlaygrounds/rig/pull/596))
+
+### Other
+
+- Refactor clients with builder pattern ([#615](https://github.com/0xPlaygrounds/rig/pull/615))
+
+## [0.2.14](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.13...rig-mongodb-v0.2.14) - 2025-07-16
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.13](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.12...rig-mongodb-v0.2.13) - 2025-07-14
+
+### Other
+
+- updated the following local packages: rig-core
+
+## [0.2.12](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.11...rig-mongodb-v0.2.12) - 2025-07-07
+
+### Other
+
+- Migrate all crates to Rust 2024 ([#539](https://github.com/0xPlaygrounds/rig/pull/539))
+- Declare shared dependencies in workspace ([#538](https://github.com/0xPlaygrounds/rig/pull/538))
+- Make clippy happy on all targets ([#542](https://github.com/0xPlaygrounds/rig/pull/542))
+
+## [0.2.11](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.10...rig-mongodb-v0.2.11) - 2025-06-09
+
+### Other
+
+- Introduce Client Traits and Testing ([#440](https://github.com/0xPlaygrounds/rig/pull/440))
+
 ## [0.2.10](https://github.com/0xPlaygrounds/rig/compare/rig-mongodb-v0.2.9...rig-mongodb-v0.2.10) - 2025-04-29
 
 ### Other
